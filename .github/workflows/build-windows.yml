@@ -44,7 +44,11 @@ jobs:
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
           name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'FlowPy — latest build' }}
-          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          # Not a prerelease: GitHub's "Latest release" link and badge
+          # skip prereleases, so marking it one 404s the very URL that
+          # gets sent to someone who just wants the download.
+          prerelease: false
+          make_latest: "true"
           body: |
             FlowPy — flow cytometry analysis. Windows build from `${{ github.sha }}`.
 
