@@ -35,20 +35,29 @@ jobs:
       # against a 500 MB storage quota and expire, while a release asset is
       # neither, and gives a permanent link that can be sent to a colleague.
       # A tagged push makes that version's release; any other push updates
-      # the rolling "latest-windows" one, so there is always a current .exe
-      # to download without tagging first.
+      # the rolling "latest" one, so there is always a current .exe to
+      # download without tagging first. The Mac build is added to the same
+      # release by hand (it cannot be cross-compiled here), so this step
+      # must not clear existing assets.
       - name: Publish the .exe as a release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest-windows' }}
-          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'FlowPy — latest Windows build' }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'FlowPy — latest build' }}
           prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
           body: |
-            FlowPy for Windows, built from `${{ github.sha }}`.
+            FlowPy — flow cytometry analysis. Windows build from `${{ github.sha }}`.
 
-            Download `FlowPy.exe` below and double-click it — nothing to install.
-            Windows SmartScreen will warn that the publisher is unknown, because
-            the executable is not signed by a recognised developer: choose
+            **Windows:** download `FlowPy.exe` and double-click it — nothing to
+            install. SmartScreen will warn that the publisher is unknown: choose
             **More info → Run anyway**.
+
+            **Mac (Apple Silicon):** download `FlowPy-mac.zip`, unzip, drag
+            **FlowPy.app** to Applications, then **right-click it → Open → Open**
+            the first time. Double-clicking gives "the developer cannot be
+            verified" with no way forward.
+
+            Both warnings appear because the app is not signed by a registered
+            Apple or Microsoft developer.
           files: dist/FlowPy.exe
           fail_on_unmatched_files: true
