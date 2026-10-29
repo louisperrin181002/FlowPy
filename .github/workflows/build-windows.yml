@@ -6,6 +6,10 @@ on:
     tags: ["v*"]
   workflow_dispatch: {}
 
+# Needed to publish the release below
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -27,8 +31,24 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller --noconfirm FlowPy.spec
 
-      - name: Upload the .exe as a build artifact
-        uses: actions/upload-artifact@v4
+      # Published as a release rather than a build artifact: artifacts count
+      # against a 500 MB storage quota and expire, while a release asset is
+      # neither, and gives a permanent link that can be sent to a colleague.
+      # A tagged push makes that version's release; any other push updates
+      # the rolling "latest-windows" one, so there is always a current .exe
+      # to download without tagging first.
+      - name: Publish the .exe as a release
+        uses: softprops/action-gh-release@v2
         with:
-          name: FlowPy-windows
-          path: dist/FlowPy.exe
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest-windows' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'FlowPy — latest Windows build' }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          body: |
+            FlowPy for Windows, built from `${{ github.sha }}`.
+
+            Download `FlowPy.exe` below and double-click it — nothing to install.
+            Windows SmartScreen will warn that the publisher is unknown, because
+            the executable is not signed by a recognised developer: choose
+            **More info → Run anyway**.
+          files: dist/FlowPy.exe
+          fail_on_unmatched_files: true
