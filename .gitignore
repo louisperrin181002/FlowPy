@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+build/
+dist/
+assets/*.iconset/
+.venv-build/
+
+# Working notes and screenshots, not source
+flowjo vs flowpi/
