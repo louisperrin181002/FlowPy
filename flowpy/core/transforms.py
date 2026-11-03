@@ -233,56 +233,70 @@ def axis_ticks_labels(transform: str, vmin: float, vmax: float,
         labels = [f"10{_superscript(d)}" for d in decades if vmin <= d <= vmax]
         return ticks, labels
 
-    elif transform == "Logicle":
-        # Decade ticks: -10⁴ … -10², 0, 10² … 10⁵
-        raw_vals = ([-(10.0 ** e) for e in (4, 3, 2)] + [0.0] +
-                    [10.0 ** e for e in (2, 3, 4, 5)])
-        display = apply_transform(np.array(raw_vals), "Logicle")
-        ticks, labels = [], []
-        for d, r in zip(display, raw_vals):
-            if vmin <= d <= vmax:
-                ticks.append(float(d))
-                if r == 0:
-                    labels.append("0")
-                else:
-                    e = int(round(np.log10(abs(r))))
-                    labels.append(("-" if r < 0 else "") + f"10{_superscript(e)}")
-        return ticks, labels
-
-    elif transform in ("Biex (FlowJo)", "Arcsinh"):
-        # Same decade ticks as Logicle, placed by running the raw decade
-        # values through this transform rather than assuming where they
-        # land — the three scales put 10² in three different places.
-        raw_vals = ([-(10.0 ** e) for e in (4, 3, 2)] + [0.0] +
-                    [10.0 ** e for e in (2, 3, 4, 5)])
-        display = apply_transform(np.array(raw_vals), transform)
-        # Biex is a lookup table and clips below its lowest entry, so every
-        # negative decade past that point maps to the same value. Labelling
-        # the clip floor "-10⁴" would put a tick where no such value can be
-        # shown, so saturated negatives are dropped rather than deduplicated
-        # into whichever one came first.
-        floor = float(apply_transform(np.array([-1e12]), transform)[0])
-        ticks, labels = [], []
-        seen = set()
-        for d, r in zip(display, raw_vals):
-            if not (vmin <= d <= vmax):
-                continue
-            if r < 0 and d <= floor + 1e-9:
-                continue
-            key = round(float(d), 6)
-            if key in seen:
-                continue
-            seen.add(key)
-            ticks.append(float(d))
-            if r == 0:
-                labels.append("0")
-            else:
-                e = int(round(np.log10(abs(r))))
-                labels.append(("-" if r < 0 else "")
-                              + f"10{_superscript(e)}")
-        return ticks, labels
+    elif transform in ("Logicle", "Biex (FlowJo)", "Arcsinh"):
+        return _decade_ticks(transform, vmin, vmax)
 
     return [], []
+
+
+def _decade_ticks(transform: str, vmin: float,
+                  vmax: float) -> tuple[list[float], list[str]]:
+    """Decade ticks for a biexponential scale, over the range it covers.
+
+    The decades are worked out from the axis itself rather than taken from
+    a fixed list. A fixed list is fine until someone widens the scale: with
+    Biex set to reach 10^9 the data was placed correctly and the axis still
+    stopped labelling at 10^5, because 10^5 was the largest entry anyone
+    had written down.
+
+    Each decade is positioned by running its raw value back through the
+    transform, so the three scales put 10^2 wherever each of them actually
+    puts it rather than where the others do.
+    """
+    # What raw values the two ends of the axis correspond to. Inverting the
+    # axis is what ties the ticks to the scale as configured, including any
+    # parameters the operator has changed.
+    try:
+        raw_lo, raw_hi = inverse_transform(np.array([vmin, vmax]), transform)
+    except Exception:                                   # pragma: no cover
+        raw_lo, raw_hi = -1e2, 1e5
+    raw_hi = float(max(raw_hi, 10.0))
+    top = int(np.floor(np.log10(raw_hi)))
+    bottom = (int(np.floor(np.log10(abs(float(raw_lo)))))
+              if raw_lo < -1 else 1)
+
+    # Below 10^2 the decades crowd into the linear region and the labels
+    # collide, so that is where both wings stop — the same convention the
+    # fixed list used.
+    raw_vals = ([-(10.0 ** e) for e in range(bottom, 1, -1)] + [0.0] +
+                [10.0 ** e for e in range(2, top + 1)])
+    if len(raw_vals) == 1:                   # nothing but zero in range
+        raw_vals = [0.0, 10.0 ** top]
+
+    display = apply_transform(np.array(raw_vals, dtype=float), transform)
+    # Biex is a lookup table and clips below its lowest entry, so every
+    # negative decade past that point maps to the same value. Labelling the
+    # clip floor "-10^4" would put a tick where no such value can be shown,
+    # so saturated negatives are dropped rather than deduplicated into
+    # whichever one came first.
+    floor = float(apply_transform(np.array([-1e12]), transform)[0])
+    ticks, labels, seen = [], [], set()
+    for d, r in zip(display, raw_vals):
+        if not (vmin <= d <= vmax):
+            continue
+        if r < 0 and d <= floor + 1e-9:
+            continue
+        key = round(float(d), 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        ticks.append(float(d))
+        if r == 0:
+            labels.append("0")
+        else:
+            e = int(round(np.log10(abs(r))))
+            labels.append(("-" if r < 0 else "") + f"10{_superscript(e)}")
+    return ticks, labels
 
 
 def _superscript(n: int) -> str:
