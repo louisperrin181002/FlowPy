@@ -121,6 +121,82 @@ def display_values(sample, idx: np.ndarray, channel: str, transform: str,
     return np.clip(vals, limits[0], limits[1])
 
 
+def offscale(sample, idx: np.ndarray, channel: str, transform: str,
+             limits: tuple[float, float]) -> dict:
+    """How many of these events the axis cannot show properly.
+
+    Three separate things, because they have different causes and
+    different fixes:
+
+    * **below / above** — outside the axis. display_values() clips them to
+      the edge, so they are drawn as a stripe along the border and look
+      like a real population sitting at the limit.
+    * **flat** — at the scale's own floor, where the transform itself runs
+      out of table. Biex does this: every value past its lowest entry maps
+      to the same number, so -300 and -3000 are drawn on top of each other
+      no matter how wide the axis is.
+
+    Clipping is why this has to be measured here rather than read off the
+    drawn values: by the time the plot has them they are already at the
+    edge and indistinguishable from events that genuinely belong there.
+    """
+    raw = np.asarray(sample.column(channel)[idx], dtype=float)
+    vals = apply_transform(raw, transform)
+    ok = np.isfinite(vals)
+    raw, vals = raw[ok], vals[ok]
+    n = int(vals.size)
+    if n == 0:
+        return {"n": 0, "below": 0, "above": 0, "flat": 0}
+    below = int(np.count_nonzero(vals < limits[0]))
+    above = int(np.count_nonzero(vals > limits[1]))
+    flat = 0
+    if transform == "Log10":
+        # Log10 has no floor to compare against: it sends every value at or
+        # below zero to exactly 0.0, which is inside the axis. Nothing is
+        # reported as off-scale and a third of a dim population can be
+        # sitting in one stripe on the baseline. Counted from the raw
+        # values, which is the only place the information still exists.
+        flat = int(np.count_nonzero(raw <= 0))
+    elif transform in ("Biex (FlowJo)", "Logicle", "Arcsinh"):
+        floor = float(apply_transform(np.array([-1e12]), transform)[0])
+        # Only a real floor: a transform with no clipping returns something
+        # far below anything the data can reach, and nothing equals it.
+        if np.isfinite(floor):
+            flat = int(np.count_nonzero(vals <= floor + 1e-9))
+    return {"n": n, "below": below, "above": above, "flat": flat}
+
+
+def offscale_summary(reports: dict) -> str:
+    """One line naming what is being lost, or empty when nothing is.
+
+    *reports* maps an axis label ("X", "Y") to an offscale() result.
+    Quiet below a tenth of a percent: a handful of events on the edge of a
+    million is not worth a warning, and a warning that is always there
+    stops being read.
+    """
+    parts = []
+    for axis, r in reports.items():
+        if not r or not r["n"]:
+            continue
+        lost = r["below"] + r["above"] + r["flat"]
+        if lost / r["n"] < 0.001:
+            continue
+        bits = []
+        if r["below"]:
+            bits.append(f"{100 * r['below'] / r['n']:.2g}% below")
+        if r["above"]:
+            bits.append(f"{100 * r['above'] / r['n']:.2g}% above")
+        if r["flat"]:
+            bits.append(f"{100 * r['flat'] / r['n']:.2g}% squashed onto "
+                        "the bottom of the scale")
+        if bits:
+            parts.append(f"{axis}: " + ", ".join(bits))
+    if not parts:
+        return ""
+    return ("Off scale — " + " · ".join(parts)
+            + ".  These are drawn on the edge, not where they belong.")
+
+
 def density_values(x: np.ndarray, y: np.ndarray, xlim, ylim,
                    bins: int = DENSITY_BINS) -> np.ndarray:
     """Per-event local density from a smoothed 2-D histogram — O(n), unlike

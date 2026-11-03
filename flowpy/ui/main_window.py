@@ -356,6 +356,35 @@ class MainWindow(QMainWindow):
         intro.setObjectName("Hint")
         lay.addWidget(intro)
 
+        # The way people actually ask for a scale: the two ends. Offered
+        # first, because the four parameters below are what the lookup
+        # table is built from and not what anyone wants to think in.
+        rng_box = QFormLayout()
+        want_lo = QDoubleSpinBox()
+        want_lo.setRange(-1e9, 0.0)
+        want_lo.setDecimals(0)
+        want_lo.setGroupSeparatorShown(True)
+        want_lo.setValue(-1000.0)
+        want_lo.setToolTip("The most negative value you want to see. "
+                           "Biex cannot start above zero.")
+        rng_box.addRow("Show from", want_lo)
+        want_hi = QDoubleSpinBox()
+        want_hi.setRange(10.0, 1e9)
+        want_hi.setDecimals(0)
+        want_hi.setGroupSeparatorShown(True)
+        want_hi.setValue(1e9)
+        rng_box.addRow("Show to", want_hi)
+        lay.addLayout(rng_box)
+        fit_btn = QPushButton("Set the scale to this range")
+        fit_btn.setToolTip(
+            "Works out the parameters below for you. The result is shown "
+            "underneath — it is not always exactly what was asked for.")
+        lay.addWidget(fit_btn)
+
+        adv = QLabel("The parameters this range works out to:")
+        adv.setObjectName("Hint")
+        lay.addWidget(adv)
+
         form = QFormLayout()
         top = QDoubleSpinBox()
         top.setRange(1.0, 1e9)
@@ -405,6 +434,19 @@ class MainWindow(QMainWindow):
 
         for box in (top, width, extra, decades):
             box.valueChanged.connect(preview)
+
+        def fit():
+            """Solve for parameters, then show them in the four boxes."""
+            T.fit_biex_range(want_lo.value(), want_hi.value())
+            p = T.get_biex_params()
+            for box, key in ((top, "max_value"), (width, "width"),
+                             (extra, "negative"), (decades, "positive")):
+                box.blockSignals(True)
+                box.setValue(p[key])
+                box.blockSignals(False)
+            preview()
+
+        fit_btn.clicked.connect(fit)
         preview()
 
         warn = QLabel(
@@ -430,6 +472,9 @@ class MainWindow(QMainWindow):
 
         bb.button(QDialogButtonBox.StandardButton.RestoreDefaults
                   ).clicked.connect(restore)
+        # Enter in a range box should fit, not dismiss the dialog.
+        for box in (want_lo, want_hi):
+            box.editingFinished.connect(lambda: None)
         bb.accepted.connect(dlg.accept)
         bb.rejected.connect(dlg.reject)
 

@@ -322,6 +322,13 @@ class PlotWidget(QWidget):
                                    QSizePolicy.Policy.Expanding)
         root.addWidget(self._canvas)
 
+        # How much of the population the axes cannot show properly
+        self._offscale = QLabel()
+        self._offscale.setObjectName("Hint")
+        self._offscale.setWordWrap(True)
+        self._offscale.setVisible(False)
+        root.addWidget(self._offscale)
+
         # Gates of this population that live on other axes
         self._other_gates = QLabel()
         self._other_gates.setObjectName("Muted")
@@ -562,6 +569,7 @@ class PlotWidget(QWidget):
                     ha="center", va="center", color="#94a3b8",
                     transform=ax.transAxes)
             self._other_gates.setText("")
+            self._offscale.setVisible(False)
             self._canvas.draw_idle()
             return
 
@@ -576,6 +584,7 @@ class PlotWidget(QWidget):
         if len(idx) == 0:
             ax.text(0.5, 0.5, "No events in this population", ha="center",
                     va="center", color="gray", transform=ax.transAxes)
+            self._offscale.setVisible(False)
             self._canvas.draw_idle()
             return
 
@@ -584,6 +593,7 @@ class PlotWidget(QWidget):
             dets = spectral_detectors(sample.channels,
                                       detector_kind(sample.channels))
             self._emit_axes([d.channel for d in dets])
+            self._offscale.setVisible(False)
             self._draw_spectrum(pop_mask, idx)
             return
         self._emit_axes([x_ch] if hist else [x_ch, y_ch])
@@ -605,9 +615,11 @@ class PlotWidget(QWidget):
             plotting.style_axes(ax, x_ch, x_tr, xlim)
             if view:
                 ax.set_xlim(view[0])
+            self._ylim_for_report = None
         else:
             ylim = plotting.axis_limits(sample, y_ch, y_tr)
             y = plotting.display_values(sample, idx, y_ch, y_tr, ylim)
+            self._ylim_for_report = ylim
             if self._plot_type.currentText() == "Dot":
                 plotting.draw_dots(ax, x, y)
             else:
@@ -653,8 +665,27 @@ class PlotWidget(QWidget):
                                           self.gates_modified.emit)
         self._edit_btn.setEnabled(selected is not None)
         self._update_hint()
+        self._report_offscale(sample, idx, x_ch, x_tr, xlim,
+                              None if hist else y_ch,
+                              None if hist else y_tr,
+                              getattr(self, "_ylim_for_report", None))
 
         self._canvas.draw_idle()
+
+    def _report_offscale(self, sample, idx, x_ch, x_tr, xlim,
+                         y_ch, y_tr, ylim):
+        """Say how much of the population the axes cannot place properly.
+
+        Shown under the plot rather than in a dialog: it is a property of
+        the view, changes whenever a scale or a population does, and is
+        only worth acting on while looking at the picture it refers to.
+        """
+        reports = {"X": plotting.offscale(sample, idx, x_ch, x_tr, xlim)}
+        if y_ch is not None and ylim is not None:
+            reports["Y"] = plotting.offscale(sample, idx, y_ch, y_tr, ylim)
+        text = plotting.offscale_summary(reports)
+        self._offscale.setText(text)
+        self._offscale.setVisible(bool(text))
 
     def _draw_spectrum(self, pop_mask, idx):
         """Full spectral profile of the population; with 'Colour gated

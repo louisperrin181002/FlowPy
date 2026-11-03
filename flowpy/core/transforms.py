@@ -173,6 +173,66 @@ def set_biex_params(**kw) -> None:
         _biex_params["width"] = -_biex_params["width"]
 
 
+def fit_biex_range(low: float, high: float, tries: int = 4) -> dict:
+    """Set the Biex scale to run from *low* to *high* in raw units.
+
+    The parameters FlowJo exposes — width basis, decades, maximum — are
+    what the lookup table is built from, not the ends it comes out with,
+    so asking for "10^-3 to 10^9" cannot be answered by setting a field.
+    It can be answered by searching: each end moves monotonically with one
+    parameter, so a bisection on each converges in a few passes.
+
+    The two interact slightly (width shifts the top by a fraction of a
+    percent), hence the repeats. Returns the parameters chosen; the caller
+    reads back biex_range() to see what was actually achieved, which is
+    not always exactly what was asked for — a scale cannot put its floor
+    above zero, and the top lands a little under the maximum by
+    construction.
+    """
+    high = float(max(high, 10.0))
+    # Aim a little past the requested floor. Landing exactly on it means
+    # rounding can put it a hair above, and then the decade the operator
+    # asked for is the one tick that gets dropped as unrepresentable —
+    # ask for -10^2 and the axis comes back with no negative label at all.
+    if low < 0:
+        low = low * 1.08
+    # Decades above the linear region. Setting this from the requested top
+    # is what stops the linear region swallowing the axis: left at the
+    # default 4.4 with a maximum of 10^9, the floor drops to -500,000.
+    positive = float(max(1.0, np.log10(high)))
+    set_biex_params(positive=positive, negative=0.0,
+                    max_value=high, width=_biex_params["width"])
+
+    def _bisect(key, lo_guess, hi_guess, target, read, rounds=40):
+        lo, hi = lo_guess, hi_guess
+        for _ in range(rounds):
+            mid = (lo + hi) / 2.0
+            set_biex_params(**{key: mid})
+            if read() < target:
+                lo = mid
+            else:
+                hi = mid
+        set_biex_params(**{key: (lo + hi) / 2.0})
+
+    for _ in range(tries):
+        # Top rises with max_value.
+        _bisect("max_value", high * 0.5, high * 3.0, high,
+                lambda: biex_range()[1])
+        if low < 0:
+            # Floor falls as width basis goes more negative, so the search
+            # runs backwards: bisect on -width.
+            lo_w, hi_w = 0.1, 20000.0
+            for _ in range(40):
+                mid = (lo_w + hi_w) / 2.0
+                set_biex_params(width=-mid)
+                if biex_range()[0] > low:
+                    lo_w = mid
+                else:
+                    hi_w = mid
+            set_biex_params(width=-(lo_w + hi_w) / 2.0)
+    return get_biex_params()
+
+
 def biex_range() -> tuple:
     """The lowest and highest raw values this biex scale can show.
 
