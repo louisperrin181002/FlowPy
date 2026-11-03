@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QPushButton, QLabel, QToolBar,
     QFileDialog, QMessageBox, QStatusBar, QDockWidget, QTabWidget,
     QMenuBar, QMenu, QApplication, QDialog, QInputDialog, QToolButton,
+    QFormLayout, QDoubleSpinBox, QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt, QSettings, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence, QColor, QIcon, QDesktopServices
@@ -122,6 +123,28 @@ def _speed_note(done_bytes: int, total: int, seconds: float) -> str:
     return note
 
 
+def _save_biex_params(params: dict) -> None:
+    st = QSettings("FlowPy", "FlowPy")
+    for k, v in params.items():
+        st.setValue(f"biex/{k}", float(v))
+
+
+def _load_biex_params() -> None:
+    """Restore the Biex settings this machine was last using."""
+    from ..core import transforms as T
+    st = QSettings("FlowPy", "FlowPy")
+    kw = {}
+    for k in ("negative", "width", "positive", "max_value"):
+        v = st.value(f"biex/{k}", None)
+        if v is not None:
+            try:
+                kw[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+    if kw:
+        T.set_biex_params(**kw)
+
+
 class MainWindow(QMainWindow):
     """Top-level application window."""
 
@@ -129,6 +152,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("FlowPy — Flow Cytometry Analysis")
         self.resize(1400, 900)
+        # Before anything is plotted: a Biex scale set on this machine last
+        # time has to be in place, or the first draw would use the defaults
+        # and every gate on Biex would be shown in the wrong place until
+        # something happened to redraw it.
+        _load_biex_params()
         theme.apply_mpl_style()
         app = QApplication.instance()
         if app is not None and not hasattr(app, "_combo_fitter"):
@@ -297,10 +325,126 @@ class MainWindow(QMainWindow):
         self._add_action(view_m, "Zoom In", lambda: self._plot.zoom(1.5))
         self._add_action(view_m, "Zoom Out", lambda: self._plot.zoom(1 / 1.5))
         self._add_action(view_m, "Fit Plot (Reset Zoom)", self._reset_zoom)
+        view_m.addSeparator()
+        self._add_action(view_m, "Biex Scale…", self._edit_biex_scale)
 
         # Help
         help_m = mb.addMenu("Help")
         self._add_action(help_m, "About FlowPy", self._show_about)
+
+    def _edit_biex_scale(self):
+        """Adjust the Biex scale: how high it goes and how far below zero.
+
+        FlowJo's own three parameters, under their own names, so a scale
+        set to match a FlowJo workspace really does match it. The pair of
+        numbers people actually want — the lowest and highest raw value
+        the axis can show — cannot be set directly, because the lookup
+        table is built from the parameters and not from its ends; so they
+        are shown live instead, updating as the parameters move.
+        """
+        from ..core import transforms as T
+
+        before = T.get_biex_params()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Biex scale")
+        lay = QVBoxLayout(dlg)
+        intro = QLabel(
+            "Biex is linear near zero and logarithmic further out. These "
+            "are FlowJo's own settings — matching them to a FlowJo "
+            "workspace makes the two agree.")
+        intro.setWordWrap(True)
+        intro.setObjectName("Hint")
+        lay.addWidget(intro)
+
+        form = QFormLayout()
+        top = QDoubleSpinBox()
+        top.setRange(1.0, 1e9)
+        top.setDecimals(0)
+        top.setGroupSeparatorShown(True)
+        top.setValue(before["max_value"])
+        top.setToolTip("Top of the scale — the largest raw value shown.")
+        form.addRow("Maximum value", top)
+
+        width = QDoubleSpinBox()
+        width.setRange(-10000.0, -0.1)
+        width.setDecimals(1)
+        width.setValue(before["width"])
+        width.setToolTip(
+            "FlowJo's width basis. More negative widens the linear region "
+            "around zero, which is what lets you see further below zero.")
+        form.addRow("Width basis", width)
+
+        extra = QDoubleSpinBox()
+        extra.setRange(0.0, 10.0)
+        extra.setDecimals(2)
+        extra.setValue(before["negative"])
+        extra.setToolTip("Extra decades of room below zero.")
+        form.addRow("Extra negative decades", extra)
+
+        decades = QDoubleSpinBox()
+        decades.setRange(1.0, 10.0)
+        decades.setDecimals(3)
+        decades.setValue(before["positive"])
+        decades.setToolTip("Decades of range above the linear region.")
+        form.addRow("Positive decades", decades)
+        lay.addLayout(form)
+
+        shows = QLabel()
+        shows.setWordWrap(True)
+        lay.addWidget(shows)
+
+        def preview():
+            T.set_biex_params(max_value=top.value(), width=width.value(),
+                              negative=extra.value(),
+                              positive=decades.value())
+            lo, hi = T.biex_range()
+            shows.setText(
+                f"<b>This scale shows raw values from {lo:,.0f} to "
+                f"{hi:,.0f}.</b><br>Anything below {lo:,.0f} is drawn at "
+                "the bottom of the axis and cannot be told apart.")
+
+        for box in (top, width, extra, decades):
+            box.valueChanged.connect(preview)
+        preview()
+
+        warn = QLabel(
+            "A gate records which scale it was drawn on, not the settings "
+            "that scale had at the time — so changing these moves every "
+            "gate already drawn on Biex.")
+        warn.setWordWrap(True)
+        warn.setObjectName("Hint")
+        lay.addWidget(warn)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.RestoreDefaults)
+        lay.addWidget(bb)
+
+        def restore():
+            d = T.BIEX_DEFAULTS
+            top.setValue(d["max_value"])
+            width.setValue(d["width"])
+            extra.setValue(d["negative"])
+            decades.setValue(d["positive"])
+
+        bb.button(QDialogButtonBox.StandardButton.RestoreDefaults
+                  ).clicked.connect(restore)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            preview()                       # whatever is in the boxes now
+            _save_biex_params(T.get_biex_params())
+            self._recompute_all_masks()     # gates on Biex have moved
+            self._plot.refresh()
+            lo, hi = T.biex_range()
+            self._statusbar.showMessage(
+                f"Biex now shows {lo:,.0f} to {hi:,.0f}", 6000)
+        else:
+            # The preview changed the live scale, so put it back.
+            T.set_biex_params(**before)
+            self._plot.refresh()
 
     def _add_action(self, menu: QMenu, label: str, slot,
                     shortcut=None) -> QAction:

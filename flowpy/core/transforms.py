@@ -13,6 +13,8 @@ another, which is why FlowPy records the scale with every gate.
 """
 
 from __future__ import annotations
+from functools import lru_cache
+
 import numpy as np
 
 TRANSFORM_NAMES = ["Linear", "Log10", "Logicle", "Biex (FlowJo)", "Arcsinh"]
@@ -25,6 +27,12 @@ ARCSINH_COFACTOR = 150.0
 #: FlowJo's own biex defaults, as written into its workspaces.
 BIEX_DEFAULTS = dict(negative=0.0, width=-10.0, positive=4.418540,
                      max_value=262144.000029)
+
+#: The biex parameters actually in use. Changed through set_biex_params(),
+#: which the interface calls; kept module-level so a plot, a gate's
+#: coordinates and an export all read the same scale rather than each
+#: building its own.
+_biex_params = dict(BIEX_DEFAULTS)
 
 
 def apply_transform(data: np.ndarray, transform: str,
@@ -123,25 +131,60 @@ def _inv_logicle(y: np.ndarray, t=262144.0, m=4.5, w=0.5, a=0.0) -> np.ndarray:
 BIEX_TOP = 4096.0
 
 
-def _biex_transform():
-    """The transform object, built once.
+@lru_cache(maxsize=8)
+def _biex_for(negative: float, width: float, positive: float,
+              max_value: float):
+    """The transform object for one set of parameters, built once.
 
     Constructing it generates a 4,097-point lookup table, which takes long
     enough to be worth never doing twice — on a plot that redraws as the
-    mouse moves it would otherwise be rebuilt on every frame.
+    mouse moves it would otherwise be rebuilt on every frame. Cached by
+    parameters rather than held in one slot so that flipping between two
+    settings stays instant.
     """
-    global _BIEX
-    try:
-        return _BIEX
-    except NameError:
-        pass
     import flowkit as fk
-    _BIEX = fk.transforms.WSPBiexTransform(**BIEX_DEFAULTS)
-    return _BIEX
+    return fk.transforms.WSPBiexTransform(
+        negative=negative, width=width, positive=positive,
+        max_value=max_value)
 
 
-_BIEX = None
-del _BIEX
+def _biex_transform():
+    return _biex_for(**_biex_params)
+
+
+def get_biex_params() -> dict:
+    """The biex parameters in use."""
+    return dict(_biex_params)
+
+
+def set_biex_params(**kw) -> None:
+    """Change the biex scale. Unknown keys are ignored.
+
+    Note for callers: gates record *which* scale they were drawn on, not
+    the parameters it had at the time, so changing these moves every gate
+    already drawn on Biex. The interface says so before applying.
+    """
+    for k in ("negative", "width", "positive", "max_value"):
+        if k in kw and kw[k] is not None:
+            _biex_params[k] = float(kw[k])
+    # Width is FlowJo's "width basis" and is negative by convention; a
+    # positive one silently produces a scale with no linear region.
+    if _biex_params["width"] > 0:
+        _biex_params["width"] = -_biex_params["width"]
+
+
+def biex_range() -> tuple:
+    """The lowest and highest raw values this biex scale can show.
+
+    What a person means by the minimum of a biex axis: below this the
+    lookup table has no entries and everything lands on the same pixel.
+    Found by inverting the ends of the output range rather than derived
+    from the parameters, so it stays right if the parameters change
+    meaning in a later FlowKit.
+    """
+    ends = np.array([0.0, BIEX_TOP])
+    lo, hi = _inv_biex(ends)
+    return float(lo), float(hi)
 
 
 def _biex(x: np.ndarray) -> np.ndarray:

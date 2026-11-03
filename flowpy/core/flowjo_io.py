@@ -19,7 +19,7 @@ from .gates import (
     Gate, PolygonGate, RectangleGate, EllipseGate, QuadrantGate, RangeGate,
     BooleanGate,
 )
-from .transforms import apply_transform, BIEX_DEFAULTS
+from .transforms import apply_transform, get_biex_params
 from .protocol import _bfs, compute_masks
 
 LOGICLE = dict(param_t=262144.0, param_w=0.5, param_m=4.5, param_a=0.0)
@@ -79,9 +79,12 @@ def _fk_transforms(flowjo: bool = False):
                                                      param_m=1.0),
             **({  # the same lookup table FlowPy draws Biex with, so a
                   # gate exported this way lands where it was drawn; no
-                  # unit conversion, both sides are FlowJo channel space
+                  # unit conversion, both sides are FlowJo channel space.
+                  # The parameters in use, not the defaults: a workspace
+                  # written with default biex while the plot used an
+                  # adjusted one would put every gate somewhere else.
                 TID["Biex (FlowJo)"]: fk.transforms.WSPBiexTransform(
-                    **BIEX_DEFAULTS)} if flowjo else {})}
+                    **get_biex_params())} if flowjo else {})}
 
 
 def _to_fk_units(values, tr: str) -> np.ndarray:
