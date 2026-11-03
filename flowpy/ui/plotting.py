@@ -65,7 +65,21 @@ COLORMAPS = {
 def population_indices(n_events: int, mask: np.ndarray | None,
                        max_events: int = MAX_PLOT_EVENTS) -> np.ndarray:
     """Event indices to draw for a population, subsampled deterministically
-    so the picture doesn't flicker between redraws."""
+    so the picture doesn't flicker between redraws.
+
+    A mask longer than *n_events* is clipped rather than trusted. Gate
+    masks belong to their sample but can outlive the event array they were
+    built from — compensation, unmixing, derived parameters and a re-read
+    after a failed load all replace it — and an over-long mask yields
+    indices past the end of every column, so the next thing to touch them
+    fails with nothing but "index 5860 is out of bounds for axis 0 with
+    size 4097". Clipping here keeps the events the mask and the sample
+    agree on; the caller is what decides whether to rebuild the mask.
+    """
+    if mask is not None and len(mask) != n_events:
+        mask = (mask[:n_events] if len(mask) > n_events
+                else np.concatenate([mask, np.zeros(n_events - len(mask),
+                                                    dtype=bool)]))
     idx = np.flatnonzero(mask) if mask is not None else np.arange(n_events)
     if len(idx) > max_events:
         rng = np.random.default_rng(42)
@@ -82,6 +96,18 @@ def axis_limits(sample, channel: str, transform: str) -> tuple[float, float]:
         return -0.25, top
     if transform == "Log10":
         return 0.0, max(1.0, float(np.log10(max(hi, 10.0))))
+    if transform == "Biex (FlowJo)":
+        # Biex has a fixed output range of 0-4096 whatever the data, so the
+        # axis is that range. Without this the plot would be drawn with raw
+        # channel limits on a display-space axis and nothing would appear
+        # where the ticks say it should.
+        from ..core.transforms import BIEX_TOP
+        return -0.01 * BIEX_TOP, BIEX_TOP
+    if transform == "Arcsinh":
+        bottom = float(apply_transform(np.array([min(lo, 0.0)]), transform)[0])
+        top = float(apply_transform(np.array([max(hi, 1.0)]), transform)[0])
+        pad = 0.03 * (top - bottom or 1.0)
+        return bottom - pad, top + pad
     lo = min(0.0, lo)
     pad = 0.02 * (hi - lo or 1.0)
     return lo - pad, hi + pad

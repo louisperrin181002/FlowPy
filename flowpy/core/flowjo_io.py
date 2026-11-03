@@ -19,12 +19,13 @@ from .gates import (
     Gate, PolygonGate, RectangleGate, EllipseGate, QuadrantGate, RangeGate,
     BooleanGate,
 )
-from .transforms import apply_transform
+from .transforms import apply_transform, BIEX_DEFAULTS
 from .protocol import _bfs, compute_masks
 
 LOGICLE = dict(param_t=262144.0, param_w=0.5, param_m=4.5, param_a=0.0)
 LOGICLE_M = 4.5
-TID = {"Logicle": "flowpy_logicle", "Log10": "flowpy_log10"}
+TID = {"Logicle": "flowpy_logicle", "Log10": "flowpy_log10",
+       "Biex (FlowJo)": "flowpy_biex"}
 _BIG = 1e12          # stands in for an open-ended rectangle edge
 COMP_ID = "FlowPy_compensation"
 
@@ -61,13 +62,26 @@ def _fk():
 # FlowPy → FlowKit
 # ---------------------------------------------------------------------------
 
-def _fk_transforms():
+def _fk_transforms(flowjo: bool = False):
+    """The transforms registered on an export session.
+
+    Biex is only included for a FlowJo workspace. It is FlowJo's own
+    lookup-table scale and has no Gating-ML equivalent, so registering it
+    unconditionally makes FlowKit write a Gating-ML file it cannot parse
+    back — which is exactly what happened: every .xml export became
+    "neither GatingML 2.0 compliant nor a FlowJo workspace".
+    """
     fk = _fk()
     return {TID["Logicle"]: fk.transforms.LogicleTransform(**LOGICLE),
             # Gating-ML flog(x) = log10(x/T)/M + 1, which with T=10, M=1 is
             # exactly FlowPy's log10(x)
             TID["Log10"]: fk.transforms.LogTransform(param_t=10.0,
-                                                     param_m=1.0)}
+                                                     param_m=1.0),
+            **({  # the same lookup table FlowPy draws Biex with, so a
+                  # gate exported this way lands where it was drawn; no
+                  # unit conversion, both sides are FlowJo channel space
+                TID["Biex (FlowJo)"]: fk.transforms.WSPBiexTransform(
+                    **BIEX_DEFAULTS)} if flowjo else {})}
 
 
 def _to_fk_units(values, tr: str) -> np.ndarray:
@@ -90,8 +104,17 @@ class _Exporter:
 
     def __init__(self, sample, report: Report,
                  channel_scales: dict[str, str] | None = None,
-                 comp_id: str | None = None):
+                 comp_id: str | None = None,
+                 available: set | None = None,
+                 fmt: str = "this file format"):
         self.s, self.report = sample, report
+        # Which FlowPy scale names this session can actually write. A
+        # reference to a transform that was never registered makes FlowKit
+        # fail at write time, so the exporter is told rather than assuming
+        # everything in TID is available.
+        self.available = (available if available is not None
+                          else set(TID))
+        self.fmt = fmt
         self.scales = channel_scales
         self.comp_id = comp_id
         self.paths: dict[str, tuple] = {}      # gate_id → FlowKit gate path
@@ -108,9 +131,25 @@ class _Exporter:
         comp = (self.comp_id if channel in self.comp_channels and
                 self.comp_id else "uncompensated")
         tr = self.scale(channel, tr)
+        if tr and tr != "Linear" and tr not in self.available:
+            # Written with no transform at all, which puts the gate in the
+            # wrong place in FlowJo rather than merely approximating it.
+            # Said once per channel instead of silently, because the file
+            # will look fine until somebody compares the gates.
+            seen = self.report.__dict__.setdefault("_unmappable", set())
+            if channel not in seen:
+                seen.add(channel)
+                usable = ", ".join(sorted(self.available - {"Linear"}))
+                self.report.notes.append(
+                    f"{channel} is on the {tr} scale, which {self.fmt} "
+                    f"cannot hold — gates on it will not line up when the "
+                    f"file is opened. Redraw them on {usable} before "
+                    "exporting.")
         return fk.Dimension(self.s.pnn.get(channel, channel),
                             compensation_ref=comp,
-                            transformation_ref=TID.get(tr) if tr else None,
+                            transformation_ref=(TID.get(tr)
+                                                if tr in self.available
+                                                else None),
                             **kw)
 
     def bound(self, channel: str, raw: float | None, **_) -> dict:
@@ -252,7 +291,8 @@ def build_session(samples, template, report: Report, flowjo: bool = False,
     written out explicitly. Returns (session, {gate_id: (name, path)})."""
     fk = _fk()
     session = fk.Session()
-    for tid, tr in _fk_transforms().items():
+    transforms = _fk_transforms(flowjo)
+    for tid, tr in transforms.items():
         session.add_transform(tid, tr)
 
     comp_id = None
@@ -271,7 +311,9 @@ def build_session(samples, template, report: Report, flowjo: bool = False,
                     "matrix in the export, so its counts will differ")
 
     scales = flowjo_scales(template) if flowjo else None
-    exp = _Exporter(template, report, scales, comp_id)
+    writable = {name for name, tid in TID.items() if tid in transforms}
+    fmt = "a FlowJo workspace" if flowjo else "a Gating-ML file"
+    exp = _Exporter(template, report, scales, comp_id, writable, fmt)
     used: dict[tuple, set] = {}
     for g in _bfs(template.gates):
         if g.parent is not None and g.parent.gate_id not in exp.paths:
@@ -306,7 +348,7 @@ def build_session(samples, template, report: Report, flowjo: bool = False,
                                 f"{template.name}'s; exported with "
                                 f"{template.name}'s gates")
             continue
-        e = _Exporter(s, report, scales, comp_id)
+        e = _Exporter(s, report, scales, comp_id, writable, fmt)
         e.paths, e.names = exp.paths, exp.names
         for gid in ids:
             a, b = mine[gid], next(g for g in _bfs(template.gates)

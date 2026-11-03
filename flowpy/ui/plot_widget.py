@@ -64,6 +64,23 @@ _HINTS = {
 _DRAW_COLOR = theme.WARN
 
 
+def _saved_plot_shape() -> str:
+    """The plot shape this machine was last set to.
+
+    Stored per machine rather than in the workspace on purpose: it is a
+    property of the screen in front of you, not of the experiment, and a
+    workspace opened on a laptop should not force a colleague's monitor
+    back to the shape it was saved on.
+    """
+    from PyQt6.QtCore import QSettings
+    return str(QSettings("FlowPy", "FlowPy").value("plot/shape", "Fit window"))
+
+
+def _save_plot_shape(name: str) -> None:
+    from PyQt6.QtCore import QSettings
+    QSettings("FlowPy", "FlowPy").setValue("plot/shape", name)
+
+
 def _is_scatter_channel(ch: str) -> bool:
     """Channels shown on a linear scale by default (scatter, time and the
     channels FlowPy computes: UMAP, t-SNE, clusters, unmixed)."""
@@ -188,6 +205,28 @@ class PlotWidget(QWidget):
             "add each gated population's median spectrum)")
         self._color_gated_cb.stateChanged.connect(self.schedule_refresh)
 
+        # Plot shape. The canvas fills whatever space the window gives it,
+        # so on a wide screen the axes come out as a wide rectangle and the
+        # same population looks a different shape than it does on a laptop.
+        # Locking the box aspect makes a plot look the same everywhere,
+        # which matters when gates are drawn by eye and then compared.
+        self._shape_box = QWidget()
+        sl = QHBoxLayout(self._shape_box)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(4)
+        sl.addWidget(self._muted("SHAPE"))
+        self._shape_combo = QComboBox()
+        for text, ratio in (("Fit window", 0.0), ("Square", 1.0),
+                            ("4:3", 3 / 4), ("3:2", 2 / 3), ("16:9", 9 / 16)):
+            self._shape_combo.addItem(text, ratio)
+        self._shape_combo.setToolTip(
+            "Shape of the plotting area. “Fit window” lets it stretch with "
+            "the window; the rest keep it to a fixed ratio whatever the "
+            "screen, so plots match between computers.")
+        self._shape_combo.setCurrentText(_saved_plot_shape())
+        self._shape_combo.currentIndexChanged.connect(self._on_shape_changed)
+        sl.addWidget(self._shape_combo)
+
         self._zoom_box = QWidget()
         zl = QHBoxLayout(self._zoom_box)
         zl.setContentsMargins(0, 0, 0, 0)
@@ -296,6 +335,8 @@ class PlotWidget(QWidget):
         bottom.setSpacing(10)
         bottom.addWidget(self._color_gated_cb)
         bottom.addSpacing(8)
+        bottom.addWidget(self._shape_box)
+        bottom.addSpacing(8)
         bottom.addWidget(self._zoom_box)
         bottom.addStretch()
         self._nav = NavToolbar(self._canvas, self)
@@ -339,6 +380,31 @@ class PlotWidget(QWidget):
         self._fig.subplots_adjust(left=72 / w, right=1 - 18 / w,
                                   bottom=(84 if spec else 58) / h,
                                   top=1 - (34 if spec else 14) / h)
+        self._apply_shape()
+
+    def _apply_shape(self):
+        """Hold the axes to the chosen ratio.
+
+        Done here because ax.cla() clears the box aspect and this runs
+        after every redraw and on every resize, so there is one place that
+        cannot be forgotten.
+        """
+        combo = getattr(self, "_shape_combo", None)
+        if combo is None:
+            return
+        ratio = combo.currentData()
+        # The spectrum is a heat map of detectors against intensity; a
+        # square would squash or stretch the detector axis, so it keeps
+        # the window's shape whatever is chosen here.
+        if not ratio or self.is_spectrum():
+            self._ax.set_box_aspect(None)
+        else:
+            self._ax.set_box_aspect(float(ratio))
+
+    def _on_shape_changed(self):
+        _save_plot_shape(self._shape_combo.currentText())
+        self._apply_shape()
+        self._canvas.draw_idle()
 
     @staticmethod
     def _muted(text: str) -> QLabel:

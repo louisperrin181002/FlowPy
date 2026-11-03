@@ -1,9 +1,30 @@
-"""Channel display transforms: Linear, Log10, Logicle (biexponential)."""
+"""Channel display transforms.
+
+Linear, Log10, and three members of the biexponential family — Logicle,
+FlowJo's Biex, and Arcsinh. All three compress a linear region around zero
+into a log-like scale further out, so events at or below background stay
+visible instead of piling against the axis; they differ in how that
+compression is parameterised, and therefore in exactly where a population
+sits on screen.
+
+Which to use is mostly a matter of matching whatever the data was gated on
+before: a gate drawn on one scale does not land in the same place on
+another, which is why FlowPy records the scale with every gate.
+"""
 
 from __future__ import annotations
 import numpy as np
 
-TRANSFORM_NAMES = ["Linear", "Log10", "Logicle"]
+TRANSFORM_NAMES = ["Linear", "Log10", "Logicle", "Biex (FlowJo)", "Arcsinh"]
+
+#: Divisor for Arcsinh. 150 is the usual choice for fluorescence on a
+#: 262,144-range instrument; 5 is common for mass cytometry. Larger values
+#: widen the linear region around zero.
+ARCSINH_COFACTOR = 150.0
+
+#: FlowJo's own biex defaults, as written into its workspaces.
+BIEX_DEFAULTS = dict(negative=0.0, width=-10.0, positive=4.418540,
+                     max_value=262144.000029)
 
 
 def apply_transform(data: np.ndarray, transform: str,
@@ -23,6 +44,10 @@ def apply_transform(data: np.ndarray, transform: str,
         return _log10(data)
     elif transform == "Logicle":
         return _logicle(data, t=t, m=m, w=w, a=a)
+    elif transform == "Biex (FlowJo)":
+        return _biex(data)
+    elif transform == "Arcsinh":
+        return _arcsinh(data)
     return data.copy()
 
 
@@ -36,6 +61,10 @@ def inverse_transform(data: np.ndarray, transform: str,
         return _inv_log10(data)
     elif transform == "Logicle":
         return _inv_logicle(data, t=t, m=m, w=w, a=a)
+    elif transform == "Biex (FlowJo)":
+        return _inv_biex(data)
+    elif transform == "Arcsinh":
+        return _inv_arcsinh(data)
     return data.copy()
 
 
@@ -79,6 +108,71 @@ def _inv_logicle(y: np.ndarray, t=262144.0, m=4.5, w=0.5, a=0.0) -> np.ndarray:
     return np.asarray(out, dtype=np.float64).reshape(y.shape)
 
 
+# ---------------------------------------------------------------------------
+# Biex — FlowJo's biexponential
+# ---------------------------------------------------------------------------
+# FlowKit's WSPBiexTransform, which is the same lookup table FlowJo builds
+# (ported from TreeStar's Java by way of cytolib). Used rather than
+# reimplemented so that a plot here and a plot in FlowJo put a population
+# in the same place — which is the only reason to offer this scale when
+# Logicle is already available.
+#
+# Output is FlowJo channel space, 0 to 4096, not the 0-to-m of Logicle.
+# Each transform carries its own display range and its own ticks.
+
+BIEX_TOP = 4096.0
+
+
+def _biex_transform():
+    """The transform object, built once.
+
+    Constructing it generates a 4,097-point lookup table, which takes long
+    enough to be worth never doing twice — on a plot that redraws as the
+    mouse moves it would otherwise be rebuilt on every frame.
+    """
+    global _BIEX
+    try:
+        return _BIEX
+    except NameError:
+        pass
+    import flowkit as fk
+    _BIEX = fk.transforms.WSPBiexTransform(**BIEX_DEFAULTS)
+    return _BIEX
+
+
+_BIEX = None
+del _BIEX
+
+
+def _biex(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    out = _biex_transform().apply(x.reshape(-1, 1))
+    return np.asarray(out, dtype=np.float64).reshape(x.shape)
+
+
+def _inv_biex(y: np.ndarray) -> np.ndarray:
+    y = np.asarray(y, dtype=np.float64)
+    out = _biex_transform().inverse(y.reshape(-1, 1))
+    return np.asarray(out, dtype=np.float64).reshape(y.shape)
+
+
+# ---------------------------------------------------------------------------
+# Arcsinh
+# ---------------------------------------------------------------------------
+# The simplest of the biexponential family and the only one with a closed
+# form: linear within about one cofactor of zero, logarithmic beyond it.
+# Exact in both directions, with no lookup table and nothing to clip, so
+# negative values survive a round trip that Biex would flatten.
+
+def _arcsinh(x: np.ndarray, cofactor: float = ARCSINH_COFACTOR) -> np.ndarray:
+    return np.arcsinh(np.asarray(x, dtype=np.float64) / cofactor)
+
+
+def _inv_arcsinh(y: np.ndarray,
+                 cofactor: float = ARCSINH_COFACTOR) -> np.ndarray:
+    return np.sinh(np.asarray(y, dtype=np.float64)) * cofactor
+
+
 def axis_ticks_labels(transform: str, vmin: float, vmax: float,
                       n_ticks: int = 6) -> tuple[list[float], list[str]]:
     """Return (tick_positions_in_display_space, tick_labels) for axis."""
@@ -110,6 +204,39 @@ def axis_ticks_labels(transform: str, vmin: float, vmax: float,
                 else:
                     e = int(round(np.log10(abs(r))))
                     labels.append(("-" if r < 0 else "") + f"10{_superscript(e)}")
+        return ticks, labels
+
+    elif transform in ("Biex (FlowJo)", "Arcsinh"):
+        # Same decade ticks as Logicle, placed by running the raw decade
+        # values through this transform rather than assuming where they
+        # land — the three scales put 10² in three different places.
+        raw_vals = ([-(10.0 ** e) for e in (4, 3, 2)] + [0.0] +
+                    [10.0 ** e for e in (2, 3, 4, 5)])
+        display = apply_transform(np.array(raw_vals), transform)
+        # Biex is a lookup table and clips below its lowest entry, so every
+        # negative decade past that point maps to the same value. Labelling
+        # the clip floor "-10⁴" would put a tick where no such value can be
+        # shown, so saturated negatives are dropped rather than deduplicated
+        # into whichever one came first.
+        floor = float(apply_transform(np.array([-1e12]), transform)[0])
+        ticks, labels = [], []
+        seen = set()
+        for d, r in zip(display, raw_vals):
+            if not (vmin <= d <= vmax):
+                continue
+            if r < 0 and d <= floor + 1e-9:
+                continue
+            key = round(float(d), 6)
+            if key in seen:
+                continue
+            seen.add(key)
+            ticks.append(float(d))
+            if r == 0:
+                labels.append("0")
+            else:
+                e = int(round(np.log10(abs(r))))
+                labels.append(("-" if r < 0 else "")
+                              + f"10{_superscript(e)}")
         return ticks, labels
 
     return [], []

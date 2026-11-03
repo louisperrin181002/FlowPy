@@ -1767,10 +1767,34 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _population(self) -> tuple[Gate | None, np.ndarray, str]:
-        """The population shown in the plot: (gate, event indices, name)."""
+        """The population shown in the plot: (gate, event indices, name).
+
+        The mask is checked against the sample it is about to index. A
+        gate mask is stored on its own sample, so it cannot come from a
+        different file — but it can outlive the event array it was built
+        from, because compensation, unmixing, derived parameters and a
+        re-read after a failed load all replace that array. When the new
+        one is shorter, np.flatnonzero returns indices past its end, and
+        the first thing to touch them fails with nothing more informative
+        than "index 5860 is out of bounds for axis 0 with size 4097".
+
+        Rather than hand those indices out, the masks are rebuilt once and
+        the result is checked again; if it still does not fit, the whole
+        sample is returned instead of a wrong subset. A population that
+        silently became the wrong events would be worse than a visible
+        loss of the gate.
+        """
         s = self._current_sample
         pop = self._gate_by_id(self._selected_gate_id)
         mask = self._gate_masks.get(pop.gate_id) if pop else None
+        if mask is not None and len(mask) != s.n_events:
+            self._recompute_all_masks()
+            mask = self._gate_masks.get(pop.gate_id) if pop else None
+            if mask is not None and len(mask) != s.n_events:
+                self._statusbar.showMessage(
+                    f"{pop.name}: the gate no longer matches this sample's "
+                    f"{s.n_events:,} events — using all events", 8000)
+                mask = None
         idx = (np.flatnonzero(mask) if mask is not None
                else np.arange(s.n_events))
         return pop, idx, pop.name if pop else "All Events"
