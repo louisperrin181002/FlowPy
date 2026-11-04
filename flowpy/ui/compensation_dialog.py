@@ -12,6 +12,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QBrush
 
 from ..core.compensation import CompensationMatrix, guess_fluorescence_channels
+from .errors import show_error
 
 
 class CompensationDialog(QDialog):
@@ -165,7 +166,7 @@ class CompensationDialog(QDialog):
             self._n_label.setText(f"Channels: {n}")
             self._populate_table()
         except Exception as exc:
-            QMessageBox.critical(self, "Import Error", str(exc))
+            show_error(self, "Import Error", exc)
 
     def _export_csv(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -179,7 +180,7 @@ class CompensationDialog(QDialog):
             df = pd.DataFrame(mat, index=self._channels, columns=self._channels)
             df.to_csv(path)
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
+            show_error(self, "Export Error", exc)
 
     def _on_accept(self):
         try:

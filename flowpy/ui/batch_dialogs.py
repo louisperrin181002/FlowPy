@@ -13,6 +13,7 @@ from PyQt6.QtCore import Qt
 
 from ..core.protocol import batch_statistics, missing_channels
 from ..core.statistics import STAT_NAMES
+from .errors import show_error
 
 
 class ApplyProtocolDialog(QDialog):
@@ -196,7 +197,7 @@ class BatchStatisticsDialog(QDialog):
         try:
             df.to_csv(path, index=False)
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
+            show_error(self, "Export Error", exc)
 
 
 def _really_missing(sample, missing: list[str], formulas: dict) -> list[str]:

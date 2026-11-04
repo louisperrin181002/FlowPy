@@ -26,6 +26,7 @@ from ..core.protocol import COUNT_STATS, population_path, _bfs
 from ..core.statistics import STAT_NAMES
 from .plotting import PALETTES
 from .theme import export_dpi
+from .errors import show_error
 
 PLOT_KINDS = ["Bar + points", "Box + points", "Points + mean",
               "Line (numeric X)"]
@@ -587,7 +588,7 @@ class GroupPlotWidget(QWidget):
         try:
             self.export_figure(path)
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
+            show_error(self, "Export Error", exc)
 
     def _export_values(self):
         df = self._values_frame()
@@ -610,7 +611,7 @@ class GroupPlotWidget(QWidget):
                     f.write("\n" + self._test_lbl.text().replace(
                         "<br>", "\n") + "\n")
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
+            show_error(self, "Export Error", exc)
 
     def _copy_values(self):
         df = self._values_frame()

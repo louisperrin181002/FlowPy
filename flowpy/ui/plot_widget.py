@@ -38,6 +38,7 @@ from .gate_editor import (
 )
 from .plotting import PLOT_TYPES
 from .widgets import ChannelCombo
+from .errors import show_error
 
 # Drawing tool modes
 MODE_NONE = "none"
@@ -902,7 +903,7 @@ class PlotWidget(QWidget):
         try:
             self.export_figure(path)
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
+            show_error(self, "Export Error", exc)
 
     def _tool_shortcut(self, mode: str):
         btn = self._mode_buttons[mode]

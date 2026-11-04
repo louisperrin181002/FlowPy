@@ -18,6 +18,7 @@ from ..core.protocol import (
     export_table, population_path, COUNT_STATS, _bfs,
 )
 from ..core.statistics import STAT_NAMES
+from .errors import show_error
 
 LAYOUTS = ["One row per sample", "One row per sample × population"]
 _SETTINGS = "export_table/"
@@ -382,7 +383,7 @@ class ExportDataDialog(QDialog):
             # utf-8-sig so Excel shows µ, ×, accents… correctly
             self._rounded().to_csv(path, index=False, encoding="utf-8-sig")
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
+            show_error(self, "Export Error", exc)
 
 
 class ChannelPickerDialog(QDialog):

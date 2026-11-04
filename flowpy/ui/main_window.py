@@ -44,6 +44,7 @@ from ..core.gates import (
     can_refit, refit, refit_error,
 )
 from ..core import protocol, analysis
+from .errors import show_error
 
 UNDO_LIMIT = 50
 WORKSPACE_FILTER = "FlowPy Workspace (*.fpw)"
@@ -856,8 +857,8 @@ class MainWindow(QMainWindow):
             self._schedule_autosave()
             return sample
         except Exception as exc:
-            QMessageBox.critical(self, "Error Loading FCS",
-                                 f"Could not load:\n{filepath}\n\n{exc}")
+            show_error(self, "Error Loading FCS", exc,
+                       f"Could not load:\n{filepath}")
             return None
 
     def _remove_sample(self):
@@ -1348,7 +1349,7 @@ class MainWindow(QMainWindow):
         try:
             self._write_workspace(self._doc_path)
         except Exception as exc:
-            QMessageBox.critical(self, "Save Error", str(exc))
+            show_error(self, "Save Error", exc)
             return False
         self._drop_recovery_copy()
         self._set_clean()
@@ -1372,7 +1373,7 @@ class MainWindow(QMainWindow):
         try:
             self._write_workspace(path)
         except Exception as exc:
-            QMessageBox.critical(self, "Save Error", str(exc))
+            show_error(self, "Save Error", exc)
             return False
         # Save (⌘S) now writes to this file; the recovery copy is no
         # longer needed
@@ -1468,7 +1469,7 @@ class MainWindow(QMainWindow):
             with open(path) as f:
                 ws = json.load(f)
         except Exception as exc:
-            QMessageBox.critical(self, "Load Error", str(exc))
+            show_error(self, "Load Error", exc)
             return
         path = Path(path)
         # Opening a recovery copy starts a new unsaved analysis from it;
@@ -1715,7 +1716,7 @@ class MainWindow(QMainWindow):
                                    .formula_specs())
             self._statusbar.showMessage(f"Protocol saved: {path}", 4000)
         except Exception as exc:
-            QMessageBox.critical(self, "Save Error", str(exc))
+            show_error(self, "Save Error", exc)
 
     def _load_protocol(self):
         if not self._samples:
@@ -1731,7 +1732,7 @@ class MainWindow(QMainWindow):
             roots = protocol.load_protocol(path)
             formulas = protocol.load_protocol_formulas(path)
         except Exception as exc:
-            QMessageBox.critical(self, "Load Error", str(exc))
+            show_error(self, "Load Error", exc)
             return
         self._apply_roots_to(roots, title=f"Apply {Path(path).name}",
                              formulas=formulas)
@@ -1828,7 +1829,11 @@ class MainWindow(QMainWindow):
                 self, "Reading the FlowJo workspace…",
                 lambda: flowjo_io.import_wsp(path, self._samples))
         except Exception as exc:
-            QMessageBox.critical(self, title, str(exc))
+            show_error(
+                self, title, exc,
+                "Open Show Details and send the whole box — the message "
+                "alone does not say which part of the workspace it came "
+                "from.")
             return
         if not self._ensure_loaded(list(result), "Reading the samples…"):
             return
@@ -1866,7 +1871,7 @@ class MainWindow(QMainWindow):
             roots, report = flowjo_io.import_gatingml(
                 path, self._current_sample)
         except Exception as exc:
-            QMessageBox.critical(self, title, str(exc))
+            show_error(self, title, exc)
             return
         if report.notes:
             ExchangeReportDialog(title, "Notes on the conversion:", report,
@@ -1909,7 +1914,7 @@ class MainWindow(QMainWindow):
             report = adlg.run_busy(self, "Writing the FlowJo workspace…",
                                    work)
         except Exception as exc:
-            QMessageBox.critical(self, title, str(exc))
+            show_error(self, title, exc)
             return
         ExchangeReportDialog(
             title, f"Saved <b>{Path(path).name}</b> ({len(gated)} samples, "
@@ -1929,7 +1934,7 @@ class MainWindow(QMainWindow):
         try:
             report = flowjo_io.export_gatingml(path, self._current_sample)
         except Exception as exc:
-            QMessageBox.critical(self, title, str(exc))
+            show_error(self, title, exc)
             return
         ExchangeReportDialog(title, f"Saved <b>{Path(path).name}</b> "
                              "(Gating-ML 2.0).", report, self).exec()
@@ -1944,7 +1949,7 @@ class MainWindow(QMainWindow):
             report = adlg.run_busy(self, "FlowKit is gating the samples…",
                                    lambda: flowjo_io.verify(gated))
         except Exception as exc:
-            QMessageBox.critical(self, title, str(exc))
+            show_error(self, title, exc)
             return
         ExchangeReportDialog(
             title, "FlowKit (validated against the Gating-ML 2.0 compliance "
@@ -2041,7 +2046,7 @@ class MainWindow(QMainWindow):
             emb = adlg.run_busy(self, f"Running {p['method']} on "
                                 f"{len(sub):,} events…", work)
         except Exception as exc:
-            QMessageBox.critical(self, p["method"], str(exc))
+            show_error(self, p["method"], exc)
             return
         prefix = "UMAP" if umap else "tSNE"
         for j in (0, 1):
@@ -2079,7 +2084,7 @@ class MainWindow(QMainWindow):
             labels, profile = adlg.run_busy(
                 self, f"Clustering {len(idx):,} events…", work)
         except Exception as exc:
-            QMessageBox.critical(self, "Clustering", str(exc))
+            show_error(self, "Clustering", exc)
             return
 
         col = np.full(s.n_events, np.nan)
@@ -2135,7 +2140,7 @@ class MainWindow(QMainWindow):
                 lambda: analysis.auto_gate(x, y, p["n"], p["coverage"],
                                            p["min_fraction"]))
         except Exception as exc:
-            QMessageBox.critical(self, "Auto Gate", str(exc))
+            show_error(self, "Auto Gate", exc)
             return
         gates = []
         for i, e in enumerate(found, 1):
@@ -2178,7 +2183,7 @@ class MainWindow(QMainWindow):
         try:
             sigs, results = adlg.run_busy(self, "Unmixing…", work)
         except Exception as exc:
-            QMessageBox.critical(self, "Spectral Unmixing", str(exc))
+            show_error(self, "Spectral Unmixing", exc)
             return
         names = [n for _, n in p["controls"]]
         for t, abund in results:

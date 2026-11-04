@@ -465,6 +465,28 @@ class _Importer:
         # Log10 — see to_raw() for the inverse.
         if name in ("LogTransform", "WSPLogTransform"):
             return "Log10", True
+        # FlowJo's own default scale. Before FlowPy had a Biex of its own
+        # this fell through to the catch-all below and every biex channel
+        # — which is most channels in most workspaces — came back as
+        # "Logicle, approximate". The gate still enclosed the right events,
+        # because to_raw() inverts with FlowJo's own transform, but it was
+        # redrawn on a different biexponential and its edges bowed.
+        #
+        # Exact only when the parameters match the Biex scale FlowPy is
+        # set to; otherwise the shape is still re-expressed, and the
+        # report says so. View -> Biex Scale... is where to match them.
+        if name == "WSPBiexTransform":
+            cur = get_biex_params()
+            same = np.allclose(
+                [float(t.negative), float(t.width), float(t.positive),
+                 float(t.max_value)],
+                [cur["negative"], cur["width"], cur["positive"],
+                 cur["max_value"]])
+            return "Biex (FlowJo)", bool(same)
+        # Closer than Logicle, though not exact: FlowPy's Arcsinh has a
+        # fixed cofactor while this carries its own parameters.
+        if name == "AsinhTransform":
+            return "Arcsinh", False
         if name == "LinearTransform":
             return "Linear", False
         return "Logicle", False

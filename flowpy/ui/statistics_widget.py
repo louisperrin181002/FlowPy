@@ -16,6 +16,7 @@ from ..core.statistics import (
     gates_in_order, sample_stats, stat_label, STAT_NAMES,
 )
 from ..core.gates import Gate
+from .errors import show_error
 
 ALL_EVENTS = "__all__"
 SHOW_MODES = ["Plot channels", "All fluorescence", "Chosen channels"]
@@ -279,4 +280,4 @@ class StatisticsWidget(QWidget):
             df["Gate"] = df["Gate"].str.strip()
             df.round(3).to_csv(path, index=False)
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
+            show_error(self, "Export Error", exc)

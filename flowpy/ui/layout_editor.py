@@ -33,6 +33,7 @@ from .gate_tree_widget import _bfs
 from .widgets import ChannelCombo
 from ..core.spectral import spectral_detectors, detector_kind
 from ..core.statistics import sample_stats
+from .errors import show_error
 
 MAX_LAYOUT_EVENTS = 20_000              # per layer per panel
 ALL_EVENTS = ""                         # population id for ungated data
@@ -1267,4 +1268,4 @@ class LayoutEditor(QWidget):
                     self._fig.savefig(path, dpi=page["dpi"],
                                       facecolor="white")
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
+            show_error(self, "Export Error", exc)

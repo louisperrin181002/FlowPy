@@ -16,6 +16,7 @@ from PyQt6.QtGui import QKeySequence
 from pathlib import Path
 
 from ..core import groups, sheets
+from .errors import show_error
 
 SEPARATORS = {"' - '  (dash with spaces)": " - ", "'_'  (underscore)": "_",
               "'-'  (dash)": "-", "' '  (space)": " ", "'.'  (dot)": "."}
@@ -312,7 +313,7 @@ class MetadataDialog(QDialog):
             src = QSettings("FlowPy", "FlowPy").value("plate/source", None)
             res = sheets.import_metadata(path, self._samples, src)
         except Exception as exc:
-            QMessageBox.critical(self, "Import Error", str(exc))
+            show_error(self, "Import Error", exc)
             return
         if not res.n_matched:
             hint = ("the wells in the plate map (FlowPy reads each file's "
@@ -362,7 +363,7 @@ class MetadataDialog(QDialog):
                 path, [_Row(s.name, vals[r])
                        for r, s in enumerate(self._samples)], self.columns)
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
+            show_error(self, "Export Error", exc)
 
     def _accept(self):
         vals = self._current_values()
