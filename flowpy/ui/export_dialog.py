@@ -3,6 +3,32 @@ populations, across chosen samples (e.g. the median of YG5 in the gated
 cells of every sample), exported as CSV or copied for Excel / Prism.
 """
 
+# ---------------------------------------------------------------------------
+# HOW THIS DIALOG WORKS
+# ---------------------------------------------------------------------------
+# The table is the product of four independent choices:
+#
+#     samples  ×  populations  ×  channels  ×  statistics
+#
+# Four checkable lists on the left, a live preview on the right. Any
+# change restarts a 150 ms timer; when it expires _recompute() rebuilds
+# the whole table. Nothing is computed incrementally — gating a handful
+# of samples is fast, and the debounce is what keeps ticking boxes
+# responsive.
+#
+#   _schedule()   a control changed; start the timer
+#   _recompute()  gather the four selections, call export_table(),
+#                 fill the preview, write the summary line, remember
+#   _fill_table() the DataFrame to the QTableWidget, formatted
+#
+# Every selection is saved to QSettings on each recompute and restored
+# on open, because the same export is usually wanted again next week.
+#
+# The summary line underneath does double duty: it says what the table
+# is, and when the table is empty it says which box still needs
+# ticking — so an empty preview is never a mystery.
+# ---------------------------------------------------------------------------
+
 from __future__ import annotations
 import pandas as pd
 
@@ -34,6 +60,12 @@ class _CheckList(QListWidget):
     """List of checkable entries with helpers."""
 
     def fill(self, entries: list[str], checked: set[str]):
+        """Replace the contents, ticking the entries named in *checked*.
+
+        Signals blocked: setCheckState emits itemChanged, so filling a
+        list of two hundred channels would otherwise schedule two
+        hundred recomputes.
+        """
         self.blockSignals(True)
         self.clear()
         for text in entries:
@@ -49,6 +81,11 @@ class _CheckList(QListWidget):
                 if self.item(i).checkState() == Qt.CheckState.Checked]
 
     def set_all(self, on: bool, visible_only: bool = False):
+        """Tick or untick everything; *visible_only* respects the filter.
+
+        visible_only is what makes "All" mean "all the channels I have
+        searched for" rather than all two hundred on the instrument.
+        """
         self.blockSignals(True)
         for i in range(self.count()):
             it = self.item(i)
@@ -56,6 +93,9 @@ class _CheckList(QListWidget):
                 it.setCheckState(Qt.CheckState.Checked if on
                                  else Qt.CheckState.Unchecked)
         self.blockSignals(False)
+        # One synthetic signal after the fact, instead of the hundreds
+        # that were just suppressed — enough to trigger a single
+        # recompute. The item passed is arbitrary; no handler reads it.
         if self.count():
             self.itemChanged.emit(self.item(0))
 
@@ -66,6 +106,7 @@ def _all_none(lst: _CheckList, visible_only: bool = False) -> QHBoxLayout:
     for text, on in (("All", True), ("None", False)):
         b = QPushButton(text)
         b.setMinimumWidth(56)
+        # on=on binds this iteration's value into the lambda.
         b.clicked.connect(lambda _=False, on=on:
                           lst.set_all(on, visible_only))
         row.addWidget(b)
@@ -79,7 +120,9 @@ class ExportDataDialog(QDialog):
     def __init__(self, samples, current=None, parent=None,
                  meta_columns: list[str] | None = None):
         super().__init__(parent)
-        # metadata columns that are filled in for at least one sample
+        # Metadata columns that are filled in for at least one sample.
+        # Offering a column that is empty everywhere would add a column
+        # of blanks to the export and nothing else.
         self._meta = [c for c in (meta_columns or [])
                       if any(s.annotations.get(c) for s in samples)]
         self.setWindowTitle("Export Data")
@@ -89,6 +132,9 @@ class ExportDataDialog(QDialog):
         self._df = pd.DataFrame()
         self._settings = QSettings("FlowPy", "FlowPy")
 
+        # The debounce behind the live preview. 150 ms is short enough
+        # to feel immediate and long enough that dragging down a list of
+        # checkboxes computes once rather than once per box.
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(150)
@@ -214,7 +260,13 @@ class ExportDataDialog(QDialog):
         return w
 
     def _populations(self) -> list[str]:
-        """Population paths of all samples, current sample's order first."""
+        """Population paths of all samples, current sample's order first.
+
+        The union across samples, not just the current one: samples may
+        carry different gating trees, and a population that exists in
+        only half of them should still be offered. The current sample
+        goes first so the order matches what the user is looking at.
+        """
         order = ([self._current] if self._current else []) + \
             [s for s in self._samples if s is not self._current]
         out = ["All Events"]
@@ -226,6 +278,11 @@ class ExportDataDialog(QDialog):
         return out
 
     def _channels(self) -> list[str]:
+        """Every channel in any sample, in first-seen order.
+
+        A list rather than a set, because panel order is meaningful and
+        a set would scramble it.
+        """
         out = []
         for s in self._samples:
             for ch in s.channels:
@@ -237,12 +294,20 @@ class ExportDataDialog(QDialog):
         st = self._settings
         pops = self._populations()
         saved_pops = set(st.value(_SETTINGS + "populations", [], list) or [])
-        # default: the deepest population of the current sample
+        # Default to the deepest population of the current sample: that
+        # is the one someone gated down to, so it is the one they most
+        # likely want numbers for.
         default_pop = {pops[-1]} if pops else set()
+        # Intersected with what exists now — a remembered population from
+        # a different experiment must not be silently re-ticked here. The
+        # `or` falls through to the default when nothing survives.
         self._pop_list.fill(pops, (saved_pops & set(pops)) or default_pop)
         chans = self._channels()
         saved_ch = set(st.value(_SETTINGS + "channels", [], list) or [])
         self._chan_list.fill(chans, saved_ch & set(chans))
+        # Count and Median as the first-run default: between them they
+        # answer "how many cells" and "how bright", which is most of
+        # what anyone exports.
         stats = set(st.value(_SETTINGS + "stats", [], list) or []) or \
             {"Count", "Median"}
         self._stat_list.fill(COUNT_STATS + STAT_NAMES, stats)
@@ -259,6 +324,11 @@ class ExportDataDialog(QDialog):
         st.setValue(_SETTINGS + "layout", self._layout.currentIndex())
 
     def _apply_filter(self, *_):
+        """Hide channels that fail the search box or the "Ticked only" box.
+
+        Hidden, not removed: a channel filtered out of view keeps its
+        tick, so searching for a second channel does not lose the first.
+        """
         text = self._filter.text().strip().lower()
         ticked = self._ticked_only.isChecked()
         for i in range(self._chan_list.count()):
@@ -268,6 +338,8 @@ class ExportDataDialog(QDialog):
             it.setHidden(bool(hide))
 
     def _on_channel_changed(self, *_):
+        # With "Ticked only" on, unticking a channel must also hide it,
+        # or the list would disagree with its own filter.
         if self._ticked_only.isChecked():
             self._apply_filter()
         self._schedule()
@@ -286,8 +358,11 @@ class ExportDataDialog(QDialog):
                 self._stat_list.checked())
 
     def _recompute(self):
+        """Rebuild the table from the four selections. See the map above."""
         samples, pops, chans, stats = self._chosen()
         self._pct.setEnabled("Percentile" in stats)
+        # Count and %Parent need no channel; Median and the rest do. This
+        # decides whether an empty channel list is a problem or not.
         need_channel = any(s not in COUNT_STATS for s in stats)
         hint = []
         if not samples:
@@ -314,6 +389,9 @@ class ExportDataDialog(QDialog):
                 QApplication.restoreOverrideCursor()
         self._fill_table()
         df = self._df
+        # Empty cells counted from column 1 onward, skipping the sample
+        # name. They are not an error — they mean a population was never
+        # gated in that sample — so they are explained rather than hidden.
         missing = int(df.iloc[:, 1:].isna().sum().sum()) if not df.empty \
             else 0
         text = (f"{len(df)} rows × {len(df.columns)} columns."
@@ -340,6 +418,9 @@ class ExportDataDialog(QDialog):
                     text = val
                 elif pd.isna(val):
                     text = "—"
+                # Counts are whole numbers. Everything else gets two
+                # decimals until it is big enough for them to be noise —
+                # a median of 12,345.67 is false precision.
                 elif str(col).endswith("Count"):
                     text = f"{int(val):,}"
                 else:
@@ -354,6 +435,12 @@ class ExportDataDialog(QDialog):
             QHeaderView.ResizeMode.ResizeToContents)
 
     def _rounded(self) -> pd.DataFrame:
+        """The table with floats cut to 4 decimals, for export.
+
+        Rounded on the way out rather than on the way in, so the preview
+        and the file agree while the full precision stays available if
+        this is ever reused.
+        """
         df = self._df.copy()
         for c in df.columns:
             if df[c].dtype.kind == "f":
@@ -363,6 +450,9 @@ class ExportDataDialog(QDialog):
     def _copy(self):
         if self._df.empty:
             return
+        # Tab-separated, which is what Excel, Prism and Numbers all
+        # paste straight into columns. A comma-separated clipboard lands
+        # in a single column.
         QApplication.clipboard().setText(
             self._rounded().to_csv(sep="\t", index=False))
         self._summary.setText(self._summary.text().split("  Copied")[0] +

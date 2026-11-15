@@ -35,7 +35,42 @@ from ..core.spectral import spectral_detectors, detector_kind
 from ..core.statistics import sample_stats
 from .errors import show_error
 
+# ---------------------------------------------------------------------------
+# HOW THE LAYOUT EDITOR IS PUT TOGETHER
+# ---------------------------------------------------------------------------
+# A page of plots, each one described entirely by data rather than by the
+# widgets that edited it:
+#
+#   LayoutItem   one panel, as a dataclass: which populations, which
+#                samples, which channels, and every style choice. This is
+#                what is saved in the workspace and what is redrawn.
+#   _Layer       one population of one sample resolved to actual events —
+#                built on the fly from a LayoutItem, never stored.
+#   LayoutEditor the list of items, the editing panels, the figure.
+#
+# The flow is one direction only: a widget writes onto the selected
+# LayoutItem, then the whole page is redrawn from the items. No panel
+# holds state of its own, so loading a workspace is just rebuilding the
+# list of items, and the editing panels follow from whatever is selected.
+#
+# Why a panel names populations and samples as *lists*: one panel can
+# overlay several populations of one sample, or one population across
+# several samples, which is the comparison a figure usually has to make.
+# _layers() turns that cross-product into what gets drawn.
+#
+# Ids rather than objects throughout — a population is a gate id, a
+# sample is its file path — because the items are serialised to JSON and
+# have to survive the workspace being closed and reopened.
+# ---------------------------------------------------------------------------
+
 MAX_LAYOUT_EVENTS = 20_000              # per layer per panel
+# A cap, not a sample size: a page of twelve panels each overlaying four
+# samples would otherwise draw millions of points into a figure where
+# they land on the same few hundred pixels anyway.
+# Both are the empty string, and both mean "whatever is the default
+# here" — no gate, and no particular sample. Written as two names
+# because they are read in different places and an empty population id
+# and an empty sample id mean quite different things.
 ALL_EVENTS = ""                         # population id for ungated data
 CURRENT = ""                            # sample id meaning "current sample"
 STAGGER_STEP = 70.0                     # % of max between staggered layers
@@ -60,6 +95,9 @@ STYLE_FIELDS = ("colormap", "palette", "dot_size", "opacity", "line_width",
 
 @dataclass
 class LayoutItem:
+    # default_factory, not a plain default: a mutable default on a
+    # dataclass is shared by every instance, so adding a population to
+    # one panel would add it to every panel created afterwards.
     population_ids: list[str] = field(default_factory=lambda: [ALL_EVENTS])
     # Sample file paths; [""] = whichever sample is selected
     sample_ids: list[str] = field(default_factory=lambda: [CURRENT])
@@ -74,6 +112,9 @@ class LayoutItem:
     stagger: bool = False              # offset overlaid histograms
     # --- style ---
     colormap: str = "Turbo"            # pseudocolour density colours
+    # Safe here, unlike on a widget: QWidget.palette() is a method, and
+    # an attribute of that name on a widget shadows it and crashes on
+    # repaint. A dataclass has no such method to hide.
     palette: str = "FlowPy"            # overlay colours
     colors: dict = field(default_factory=dict)   # layer key -> "#rrggbb"
     dot_size: float = 1.5
@@ -104,12 +145,26 @@ class LayoutItem:
 
     @classmethod
     def from_dict(cls, d: dict) -> "LayoutItem":
+        """Rebuild from JSON, ignoring keys this version does not know.
+
+        A workspace written by a later FlowPy opens here with the
+        settings the two versions share, instead of raising on an
+        unexpected key and losing the whole page.
+        """
         known = cls.__dataclass_fields__
         return cls(**{k: v for k, v in d.items() if k in known})
 
 
 @dataclass
 class _Layer:
+    """One population of one sample, resolved to events ready to draw.
+
+    Built fresh by _layers() each time a panel is drawn and never
+    saved — it holds a mask over a sample's events, which is exactly
+    what a workspace must not contain.
+    """
+    # Identifies the layer within its panel, and is the key under which
+    # a hand-picked colour is stored in LayoutItem.colors.
     key: str                           # "<sample id>|<population id>"
     sample: object
     gate: Gate | None
@@ -119,6 +174,8 @@ class _Layer:
 
 def _fmt(v: float) -> str:
     """Compact number for stat labels: 21,126 · 845 · 3.27 · –12.5"""
+    # An empty population gives a mean of NaN, which must appear as a
+    # dash on the figure rather than the word "nan".
     if not np.isfinite(v):
         return "–"
     if abs(v) >= 1000:
@@ -129,14 +186,18 @@ def _fmt(v: float) -> str:
 
 
 def _swatch(color: str) -> QIcon:
+    """A small square of colour, for a combo box entry."""
     pm = QPixmap(14, 14)
     pm.fill(QColor(color))
     return QIcon(pm)
 
 
 def _scrolled(widget: QWidget) -> QScrollArea:
+    """*widget* in a scroll area, framed to look like part of the panel."""
     area = QScrollArea()
     area.setWidget(widget)
+    # Without this the widget keeps its size-hint size and the area
+    # scrolls instead of the contents reflowing to the panel's width.
     area.setWidgetResizable(True)
     area.setFrameShape(QFrame.Shape.NoFrame)
     return area
@@ -150,10 +211,15 @@ class _RangeEdit(QLineEdit):
         self.setPlaceholderText(placeholder)
 
     def value(self) -> float | None:
+        """The number typed, or None for automatic."""
         try:
+            # Thousands separators removed, since a user reading an axis
+            # may well type 10,000.
             v = float(self.text().replace(",", "").strip())
         except ValueError:
             return None
+        # "inf" and "nan" parse as floats but are not usable axis
+        # limits; both become automatic.
         return v if np.isfinite(v) else None
 
     def set_value(self, v: float | None):
@@ -558,6 +624,9 @@ class LayoutEditor(QWidget):
         self._transparent_cb.setChecked(bool(d.get("transparent", False)))
         for w in page:
             w.blockSignals(False)
+        # Blocked while the list is rebuilt: clear() and addItem() each
+        # emit a selection change, which would write the newly loaded
+        # page straight back out again through the editing panels.
         self._list.blockSignals(True)
         self._list.clear()
         for _ in self._items:
@@ -573,6 +642,11 @@ class LayoutEditor(QWidget):
     # ------------------------------------------------------------------
 
     def _channels(self) -> list[str]:
+        """Channel names to offer, from the current sample or the first.
+
+        Falls back to the first open sample so the channel combos are
+        populated even before anything has been selected.
+        """
         ref = self._current or (self._samples[0] if self._samples else None)
         return list(ref.channels) if ref is not None else []
 
@@ -581,8 +655,17 @@ class LayoutEditor(QWidget):
         whose events have been read."""
         out, seen = [], set()
         for sid in item.sample_ids:
+            # CURRENT is resolved late, every time the panel is drawn,
+            # which is what lets one saved layout follow whichever
+            # sample the user clicks.
             s = (self._current if sid == CURRENT else
                  next((x for x in self._samples if x.filepath == sid), None))
+            # Three conditions: still open; not already in the list
+            # (CURRENT and its own path can name the same sample twice,
+            # which would draw it on top of itself); and its events
+            # actually read, since the layout draws without waiting.
+            # Identity, not equality — Sample does not define __eq__ and
+            # two samples can share a name.
             if s is not None and id(s) not in seen \
                     and getattr(s, "is_loaded", True):
                 seen.add(id(s))
@@ -591,18 +674,31 @@ class LayoutEditor(QWidget):
 
     @staticmethod
     def _gate_in(sample, gid: str) -> Gate | None:
+        """That sample's own gate with this id, or None.
+
+        Each sample has its own gate tree, so the same population id has
+        to be looked up per sample — and may simply not exist in one of
+        them, which is why a layer is skipped rather than failing.
+        """
         return next((g for g in _bfs(sample.gates) if g.gate_id == gid), None)
 
     def _known_populations(self) -> list[tuple[str, str]]:
         """(gate_id, path name) of every population in any loaded sample,
         current sample first."""
+        # All Events first and always: it needs no gate to exist.
         seen, out = set(), [(ALL_EVENTS, "All Events")]
+        # Current sample first, so its populations head the list the
+        # user is about to choose from; the rest follow, with the
+        # current one filtered out so it is not offered twice.
         order = ([self._current] if self._current else []) + \
             [s for s in self._samples if s is not self._current]
         for s in order:
             for g in _bfs(s.gates):
                 if g.gate_id not in seen:
                     seen.add(g.gate_id)
+                    # The full path, "Cells / Live / CD4+", because a
+                    # bare gate name is ambiguous across a tree where
+                    # several parents may each have a "P1".
                     out.append((g.gate_id, " / ".join(
                         a.name for a in g.ancestors() + [g])))
         return out
@@ -617,7 +713,16 @@ class LayoutEditor(QWidget):
         return None
 
     def _layers(self, item: LayoutItem) -> list[_Layer]:
+        """One panel's samples x populations, resolved to drawable layers.
+
+        The cross-product is what makes a panel a comparison: four
+        samples of one population, or one sample's four populations, or
+        both at once.
+        """
         samples = self._resolve_samples(item)
+        # Which of the two is varying decides how a layer is labelled
+        # below — repeating the sample name on every entry of a
+        # single-sample overlay is noise on a figure.
         multi_s = len(samples) > 1
         multi_p = len(item.population_ids) > 1
         layers = []
@@ -628,6 +733,10 @@ class LayoutEditor(QWidget):
                 else:
                     gate = self._gate_in(s, gid)
                     mask = s.gate_masks.get(gid)
+                    # Skipped rather than drawn empty: a sample that was
+                    # never given this gate has nothing to show for it,
+                    # and an all-False mask would put a legend entry and
+                    # a 0% label on the figure as though it did.
                     if gate is None or mask is None:
                         continue
                 pname = gate.name if gate else "All Events"
@@ -1038,28 +1147,53 @@ class LayoutEditor(QWidget):
         xlim = self._limits(ref, x_ch, x_tr, item.x_min, item.x_max)
         ylim = None if hist else self._limits(ref, y_ch, y_tr, item.y_min,
                                               item.y_max)
+        # Staggering only means anything for overlaid histograms: it
+        # lifts each one onto its own baseline so several distributions
+        # can be read without hiding one another.
         stagger = hist and overlay and item.stagger
+        # Forced on when staggering — the offsets below are in percent
+        # of maximum, so unnormalised counts would put one layer's
+        # baseline somewhere inside another's peak.
         normalize = item.normalize or stagger
         colors = self._layer_colors(item, layers)
         alpha = item.opacity / 100.0
         channels = [x_ch] if hist else [x_ch, y_ch]
         stat_name = stat_label(item.stat, item.stat_pct)
+        # Only a statistic that IS a position on the axis can be drawn
+        # on the axis. A median can be a line; a CV or a count cannot,
+        # so asking to mark one is quietly ignored rather than plotted
+        # at a meaningless place.
         mark = item.stat_mark and item.stat in LOCATION_STATS
         stat_lines = []     # text for the single-population stats box
 
         for k, lay in enumerate(layers):
             s = lay.sample
+            # Indices rather than the values themselves: the same
+            # subsample has to be used for x and y, or a dot plot would
+            # pair one event's x with another's y.
             idx = plotting.population_indices(s.n_events, lay.mask,
                                               MAX_LAYOUT_EVENTS)
+            # Non-finite values dropped before drawing. A compensated
+            # channel can go negative and a log transform then yields
+            # NaN; matplotlib would silently drop those points but the
+            # statistics and the axis limits would still have counted
+            # them.
             keep = np.isfinite(s.column(x_ch)[idx])
             if not hist:
                 keep &= np.isfinite(s.column(y_ch)[idx])
             idx = idx[keep]
             color = colors[k]
             vals = self._stats(item, lay, channels)
+            # From the mask, not from len(idx): the count on the figure
+            # must be the real population size, not the number of
+            # points the subsample happened to draw.
             n_pop = (int(lay.mask.sum()) if lay.mask is not None
                      else s.n_events)
             label = lay.label
+            # Where the numbers go depends on the panel: an overlay has
+            # a legend, so each layer's statistics belong on its own
+            # legend entry; a single population has no legend, so they
+            # are collected into a text box instead.
             if overlay:
                 extra = []
                 if vals:
@@ -1077,9 +1211,16 @@ class LayoutEditor(QWidget):
                     stat_lines.append(f"n = {n_pop:,}")
 
             x = plotting.display_values(s, idx, x_ch, x_tr, xlim)
+            # A statistic is computed on the RAW values but has to be
+            # drawn in display space, so it is passed through the same
+            # transform as the axis. Computing a median of transformed
+            # values instead would give a different number — the
+            # transforms are non-linear.
             disp = [float(apply_transform(np.array([v]), tr)[0])
                     for v, tr in zip(vals, (x_tr, y_tr))] if mark else []
             if hist:
+                # Counted backwards, so the first layer sits at the top
+                # of the stack and the reading order matches the legend.
                 base = (len(layers) - 1 - k) * STAGGER_STEP if stagger else 0
                 plotting.draw_histogram(
                     ax, x, xlim, color=color, label=label,
@@ -1130,9 +1271,15 @@ class LayoutEditor(QWidget):
             ax.set_ylim(item.y_min if item.y_min is not None else lo,
                         item.y_max if item.y_max is not None else hi)
         if stagger:
+            # No y axis at all when staggered: the axis would read as a
+            # single scale, but each histogram has its own baseline, so
+            # any number against it would be wrong for every layer but
+            # the bottom one.
             ax.set_yticks([])
             ax.set_ylabel("")
             ax.spines["left"].set_visible(False)
+            # Room for the top layer's full height (100%) plus a little,
+            # on top of the offset of the highest baseline.
             ax.set_ylim(0, (len(layers) - 1) * STAGGER_STEP + 110)
         elif overlay:
             self._legend(ax, item, fs, stat_name if item.stat != NO_STAT

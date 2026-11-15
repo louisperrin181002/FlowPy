@@ -10,6 +10,37 @@ Edits are reported as ``[(gate, {attribute: new value})]`` so the main window
 can take an undo snapshot before applying them.
 """
 
+# ---------------------------------------------------------------------------
+# HOW DRAGGING A GATE WORKS
+# ---------------------------------------------------------------------------
+# A gate stores its coordinates in RAW channel values, because the scale
+# on the axes can be changed afterwards and the gate must not move. The
+# mouse, however, lives in DISPLAY space. So the editor keeps a second
+# copy of the geometry:
+#
+#   gate.vertices etc.   raw, the truth, written back only on release
+#   self.geom            display space, what is dragged
+#
+# _load_geometry() converts in with _fwd(), _changes() converts back out
+# with _inv(). Everything between those two is display space.
+#
+# The drag itself is a three-step loop:
+#
+#   press()       hit-test the handles in *pixels*, then the body;
+#                 snapshot the geometry and the canvas
+#   _on_motion()  recompute geom from the snapshot + the offset, and
+#                 blit the preview over the saved background
+#   _on_release() hand the raw-space changes to the main window, which
+#                 takes an undo snapshot and applies them
+#
+# Recomputing from the *start* snapshot rather than accumulating deltas
+# is what stops rounding error creeping in over a long drag.
+#
+# Blitting matters: a pseudocolour plot of a million events takes far
+# too long to redraw per mouse-move, so the background is captured once
+# and only the outline and handles are repainted on top.
+# ---------------------------------------------------------------------------
+
 from __future__ import annotations
 import numpy as np
 
@@ -30,26 +61,45 @@ from ..core.gates import (
     BooleanGate,
 )
 
-PICK_PX = 9          # handle hit radius, in screen pixels
+#: Handle hit radius in screen pixels, not data units. Pixels because a
+#: handle is a fixed size on screen whatever the zoom, so the target
+#: must be too — in data units it would become unclickable when zoomed
+#: out and absurdly large when zoomed in.
+PICK_PX = 9
 
 
 def _fwd(v, tr):
+    """One raw value to display space. Wraps the array-based transform."""
     return float(apply_transform(np.array([v], dtype=float), tr)[0])
 
 
 def _inv(v, tr):
+    """One display value back to raw. The inverse of _fwd."""
     return float(inverse_transform(np.array([v], dtype=float), tr)[0])
 
 
 def quadrant_siblings(gate: QuadrantGate, siblings: list[Gate]) -> list[Gate]:
-    """The four Q gates drawn together share channels and centre."""
+    """The four Q gates drawn together share channels and centre.
+
+    A quadrant is stored as four independent gates, so moving the
+    crosshair has to move all four. They are identified by sharing both
+    channels and the same centre, there being no group object to ask.
+    """
     return [g for g in siblings if isinstance(g, QuadrantGate)
             and g.x_channel == gate.x_channel and g.y_channel == gate.y_channel
             and g.cx == gate.cx and g.cy == gate.cy]
 
 
 def edit_blocker(gate: Gate, x_tr: str, y_tr: str | None) -> str | None:
-    """Why *gate* can't be edited on this plot (None = it can)."""
+    """Why *gate* can't be edited on this plot (None = it can).
+
+    A polygon or ellipse drawn on one scale is a different shape on
+    another: the straight edges between its vertices bend. Dragging it
+    on the wrong axes would therefore silently change which events it
+    contains, so editing is refused with an explanation instead.
+    Rectangles and ranges are exempt — their edges are axis-aligned and
+    survive a change of scale unchanged.
+    """
     if isinstance(gate, BooleanGate):
         return "Boolean gates are edited with Edit Values…"
     if isinstance(gate, (PolygonGate, EllipseGate)) and \
@@ -73,10 +123,13 @@ class GateEditor:
         self._load_geometry()
 
         self._drag = None             # (kind, index, start_xy, start_geom)
+        # The captured canvas, for blitting during a drag — see above.
         self._background = None
         self._handles = Line2D([], [], ls="none", marker="s", ms=7,
                                mfc="white", mec=self.color, mew=1.8, zorder=8,
                                animated=False)
+        # animated=True keeps this line out of the normal draw, so it
+        # exists only in the blitted overlay and does not appear twice.
         self._preview = Line2D([], [], color=self.color, lw=1.6, ls="--",
                                zorder=7, animated=True)
         ax.add_line(self._handles)
@@ -100,6 +153,9 @@ class GateEditor:
             self.geom = {"x0": _fwd(g.x_min, xt), "x1": _fwd(g.x_max, xt),
                          "y0": _fwd(g.y_min, yt), "y1": _fwd(g.y_max, yt)}
         elif isinstance(g, EllipseGate):
+            # Not converted: an ellipse is already stored in the display
+            # space of the axes it was drawn on, which is why
+            # edit_blocker() refuses to edit one on different axes.
             self.geom = {"cx": g.cx, "cy": g.cy, "sx": g.semi_x,
                          "sy": g.semi_y, "ang": g.angle_deg}
         elif isinstance(g, RangeGate):
@@ -115,6 +171,9 @@ class GateEditor:
             return [(geom["x0"], geom["y0"]), (geom["x1"], geom["y0"]),
                     (geom["x1"], geom["y1"]), (geom["x0"], geom["y1"])]
         if isinstance(g, EllipseGate):
+            # Three handles: the centre, a point on the major axis and
+            # one on the minor. The two axis handles are placed by
+            # rotating the unit vectors by the ellipse's angle.
             t = np.deg2rad(geom["ang"])
             return [(geom["cx"], geom["cy"]),
                     (geom["cx"] + geom["sx"] * np.cos(t),
@@ -122,6 +181,8 @@ class GateEditor:
                     (geom["cx"] - geom["sy"] * np.sin(t),
                      geom["cy"] + geom["sy"] * np.cos(t))]
         if isinstance(g, RangeGate):
+            # A range has no y extent, so its handles are parked at the
+            # vertical middle of whatever is currently on screen.
             ylo, yhi = self.ax.get_ylim()
             mid = ylo + 0.5 * (yhi - ylo)
             return [(geom["x0"], mid), (geom["x1"], mid)]
@@ -149,13 +210,19 @@ class GateEditor:
             return np.array([(geom["x0"], ylo), (geom["x0"], yhi),
                              (geom["x1"], yhi), (geom["x1"], ylo),
                              (geom["x0"], ylo)])
-        if isinstance(g, QuadrantGate):     # crosshair drawn as one path
+        # The NaN pair breaks the line: matplotlib lifts the pen there,
+        # so one Line2D draws both arms of the crosshair without a
+        # diagonal joining them.
+        if isinstance(g, QuadrantGate):
             return np.array([(xlo, geom["cy"]), (xhi, geom["cy"]),
                              (np.nan, np.nan), (geom["cx"], ylo),
                              (geom["cx"], yhi)])
         return np.empty((0, 2))
 
     def _inside(self, x, y) -> bool:
+        """Is (x, y) within the gate's outline? Used to start a move."""
+        # A quadrant has no inside — it is two infinite lines — so only
+        # its centre handle can be grabbed.
         if isinstance(self.gate, QuadrantGate):
             return False
         return MplPath(self._outline(self.geom)).contains_point((x, y))
@@ -169,6 +236,9 @@ class GateEditor:
         Returns True when the press was consumed."""
         if event.inaxes != self.ax or event.xdata is None or event.button != 1:
             return False
+        # Hit-test in pixels: transform the handles to screen
+        # coordinates and measure there. event.x/event.y are already
+        # pixels, unlike event.xdata/ydata which are data units.
         pts = self._handle_points(self.geom)
         if pts:
             scr = self.ax.transData.transform(np.array(pts))
@@ -183,10 +253,18 @@ class GateEditor:
         return False
 
     def _start(self, kind, index, event):
+        """Begin a drag: snapshot the geometry and the canvas."""
         import copy
+        # A deep copy, because the polygon case holds a list of tuples
+        # and a shallow copy would be mutated in place by _on_motion.
         self._drag = (kind, index, (event.xdata, event.ydata),
                       copy.deepcopy(self.geom))
+        # Distinguishes a drag from a plain click on release.
         self._moved = False
+        # Capture the background *without* the handles, then put them
+        # back as animated artists. If they were captured too, the saved
+        # image would contain handles at their old positions and they
+        # would smear across the plot as it is dragged.
         self._handles.set_visible(False)
         self.canvas.draw()
         self._background = self.canvas.copy_from_bbox(self.ax.bbox)
@@ -197,12 +275,19 @@ class GateEditor:
         if self._drag is None or event.inaxes != self.ax or event.xdata is None:
             return
         kind, i, (x0, y0), start = self._drag
+        # Offset from where the drag *began*, applied to the snapshot —
+        # not an increment on the current geometry. See the note at the
+        # top of the file.
         dx, dy = event.xdata - x0, event.ydata - y0
         self._moved = True
+        # Fresh shallow copy each move, with the vertex list copied too
+        # so the snapshot itself is never modified.
         g, geom = self.gate, {k: (list(v) if isinstance(v, list) else v)
                               for k, v in start.items()}
         x, y = event.xdata, event.ydata
 
+        # Moving the whole gate: shift every coordinate it has. Written
+        # by key name so one branch covers all five gate types.
         if kind == "move":
             if "verts" in geom:
                 geom["verts"] = [(vx + dx, vy + dy) for vx, vy in geom["verts"]]
@@ -215,16 +300,29 @@ class GateEditor:
         elif isinstance(g, PolygonGate):
             geom["verts"][i] = (x, y)
         elif isinstance(g, RectangleGate):
+            # Corner order from _handle_points is (x0,y0), (x1,y0),
+            # (x1,y1), (x0,y1) — so corners 0 and 3 own the left edge,
+            # 0 and 1 the bottom. Dragging a corner moves both of its
+            # edges and leaves the opposite ones fixed.
             geom["x0" if i in (0, 3) else "x1"] = x
             geom["y0" if i in (0, 1) else "y1"] = y
         elif isinstance(g, EllipseGate):
             if i == 0:
                 geom["cx"], geom["cy"] = start["cx"] + dx, start["cy"] + dy
-            elif i == 1:                       # major axis: size + rotation
+            elif i == 1:
+                # Major-axis handle does size and rotation together: the
+                # distance from the centre is the new semi-axis, the
+                # direction is the new angle. That is why an ellipse
+                # needs no separate rotation handle.
                 vx, vy = x - geom["cx"], y - geom["cy"]
                 geom["sx"] = max(np.hypot(vx, vy), 1e-9)
                 geom["ang"] = float(np.degrees(np.arctan2(vy, vx)))
-            else:                              # minor axis: size only
+            else:
+                # Minor axis: only the component of the mouse offset
+                # *perpendicular* to the major axis counts, so dragging
+                # along the ellipse does not resize it. That projection
+                # is the rotation matrix's second row. Floored at 1e-9
+                # because a zero semi-axis is a degenerate shape.
                 a = np.deg2rad(geom["ang"])
                 geom["sy"] = max(abs(-(x - geom["cx"]) * np.sin(a)
                                      + (y - geom["cy"]) * np.cos(a)), 1e-9)
@@ -237,6 +335,12 @@ class GateEditor:
         self._draw_preview()
 
     def _draw_preview(self):
+        """Repaint just the outline and handles, over the saved canvas.
+
+        restore -> draw_artist -> blit is matplotlib's fast path: the
+        expensive scatter underneath is never redrawn, so dragging stays
+        smooth on a plot of a million events.
+        """
         self.canvas.restore_region(self._background)
         out = self._outline(self.geom)
         self._preview.set_data(out[:, 0], out[:, 1])
@@ -250,7 +354,11 @@ class GateEditor:
         if self._drag is None:
             return
         self._drag = None
+        # Back to a normally drawn artist, so the handles survive the
+        # next full redraw.
         self._handles.set_animated(False)
+        # A click that moved nothing is not an edit: reporting one would
+        # push a pointless entry onto the undo stack.
         if self._moved:
             self.on_done(self._changes())
         else:

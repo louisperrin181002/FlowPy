@@ -27,6 +27,10 @@ class ApplyProtocolDialog(QDialog):
         self._samples = samples
         lay = QVBoxLayout(self)
 
+        # Count the gates up front so the heading can say how big the
+        # protocol is. Copying gates onto a sample replaces what was there,
+        # so the number is the main thing that tells someone whether they
+        # are about to overwrite a little work or a lot.
         n_gates = _count(roots)
         src = f" from <b>{source.name}</b>" if source is not None else ""
         info = QLabel(
@@ -37,17 +41,26 @@ class ApplyProtocolDialog(QDialog):
         info.setWordWrap(True)
         lay.addWidget(info)
 
+        # One row per sample, carrying its index rather than its name:
+        # two files can legitimately share a name, and the index is what
+        # selected_samples() needs to hand back the object itself.
         self._list = QListWidget()
         for i, s in enumerate(samples):
             missing = _really_missing(s, missing_channels(s, roots),
                                       formulas or {})
             if s is source:
-                continue
+                continue           # never offer to copy a sample onto itself
             it = QListWidgetItem(s.name + (f"   — {len(_flat(s.gates))} gates "
                                            "(will be replaced)"
                                            if s.gates else ""))
             it.setData(Qt.ItemDataRole.UserRole, i)
             if missing:
+                # A sample without the gates' channels cannot take the
+                # protocol at all, so the row is disabled rather than
+                # merely unticked: left tickable, it would be ticked by
+                # Select all and then fail silently during the copy. The
+                # names of the missing channels are shown because the
+                # usual cause is a panel difference worth noticing.
                 it.setText(f"{s.name}   — missing {', '.join(missing)}")
                 it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEnabled)
                 it.setCheckState(Qt.CheckState.Unchecked)
@@ -75,12 +88,16 @@ class ApplyProtocolDialog(QDialog):
         lay.addWidget(bb)
 
     def _set_all(self, state):
+        """Tick or untick every row that is allowed to be ticked."""
         for i in range(self._list.count()):
             it = self._list.item(i)
+            # Skip the disabled rows, or Select all would arm the samples
+            # that are missing channels.
             if it.flags() & Qt.ItemFlag.ItemIsEnabled:
                 it.setCheckState(state)
 
     def selected_samples(self):
+        """The sample objects the user ticked, in list order."""
         return [self._samples[self._list.item(i).data(Qt.ItemDataRole.UserRole)]
                 for i in range(self._list.count())
                 if self._list.item(i).checkState() == Qt.CheckState.Checked]
@@ -137,15 +154,26 @@ class BatchStatisticsDialog(QDialog):
         self._recompute()
 
     def _recompute(self):
+        """Re-run the statistics. Needed only when the statistic changes.
+
+        Separate from _refresh() because gating every sample is the
+        expensive half: switching the *view* only reshapes a table that
+        has already been computed, and should not pay for it again.
+        """
         stat = self._stat.currentText()
+        # The percentile box is meaningless for Median, Mean and the rest,
+        # so it appears only when it does something.
         self._pct.setVisible(stat == "Percentile")
         self._df = batch_statistics(self._samples, stat, self._pct.value())
         if self.sender() in (self._stat, self._pct):
-            # channel statistics are only shown in the full table
+            # Channel statistics appear only in the full table. Someone who
+            # just changed the statistic while looking at a % Parent grid
+            # would otherwise see nothing happen and conclude it was broken.
             self._view.setCurrentIndex(3)
         self._refresh()
 
     def _shown(self) -> pd.DataFrame:
+        """The table as the chosen view wants it: long, or pivoted wide."""
         df = self._df
         if df is None or df.empty:
             return pd.DataFrame()
@@ -153,15 +181,24 @@ class BatchStatisticsDialog(QDialog):
         if v == 3:
             return df
         value = ["% Parent", "Count", "% Total"][v]
+        # Gating order, not alphabetical: a gating tree read out of order
+        # is far harder to follow. dict.fromkeys keeps first appearance and
+        # drops repeats, and sort=False stops pivot_table re-sorting it.
         order = list(dict.fromkeys(df["Population"]))
         wide = df.pivot_table(index="Sample", columns="Population",
                               values=value, aggfunc="first", sort=False)
         wide = wide[[c for c in order if c in wide.columns]]
         if v != 1:
+            # "All Events" is 100% of its parent and 100% of the total by
+            # definition, so it is a column of constants in every view but
+            # the counts.
             wide = wide.drop(columns=["All Events"], errors="ignore")
+        # reindex puts the samples back in the order of the sample list and
+        # keeps any that produced no rows, as blanks rather than absences.
         return wide.reindex([s.name for s in self._samples]).reset_index()
 
     def _refresh(self):
+        """Redraw the table from whatever _shown() returns."""
         df = self._shown()
         self._table.clear()
         self._table.setRowCount(len(df))
@@ -170,6 +207,10 @@ class BatchStatisticsDialog(QDialog):
         for r, row in enumerate(df.itertuples(index=False)):
             for c, val in enumerate(row):
                 if isinstance(val, float):
+                    # Counts are whole numbers; percentages and channel
+                    # statistics get two decimals until they are large
+                    # enough that the decimals are noise. An empty cell is
+                    # a dash, because a blank reads as a zero.
                     text = "—" if pd.isna(val) else (
                         f"{val:,.0f}" if self._view.currentIndex() == 1
                         else f"{val:,.2f}" if abs(val) < 1000 else f"{val:,.0f}")
@@ -178,6 +219,8 @@ class BatchStatisticsDialog(QDialog):
                 else:
                     text = str(val)
                 it = QTableWidgetItem(text)
+                # Numbers right-aligned so their digits line up down the
+                # column; the first column is the sample name and stays left.
                 if c > 0 and not isinstance(val, str):
                     it.setTextAlignment(Qt.AlignmentFlag.AlignRight |
                                         Qt.AlignmentFlag.AlignVCenter)
@@ -186,6 +229,7 @@ class BatchStatisticsDialog(QDialog):
             QHeaderView.ResizeMode.ResizeToContents)
 
     def _export(self):
+        """Write out exactly the table on screen, not the full dataset."""
         df = self._shown()
         if df.empty:
             return

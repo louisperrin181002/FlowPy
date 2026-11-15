@@ -1,5 +1,39 @@
 """FlowPy — Main application window."""
 
+# ---------------------------------------------------------------------------
+# HOW THE WINDOW IS PUT TOGETHER
+# ---------------------------------------------------------------------------
+# One window is one workspace: a list of samples, each carrying its own
+# gates, masks and undo stack. Several windows may be open at once, which
+# is why _WINDOWS exists and why the session files below are numbered.
+#
+# The widgets and what they are fed:
+#
+#   SampleList     the samples; emits the one that was clicked
+#   PlotWidget     the plot and the gate-drawing tools
+#   GateTreeWidget the gating hierarchy with its counts
+#   StatisticsWidget / GroupPlotWidget / LayoutEditor   the other tabs
+#
+# State lives on the *sample*, not on the window:
+#
+#   sample.gates        its gating tree
+#   sample.gate_masks   {gate_id: boolean mask}, cached per sample
+#   sample.undo_stack   snapshots of the tree, per sample
+#
+# The window's _root_gates and _gate_masks are properties that proxy
+# through to the current sample, so switching sample switches all of it
+# at once and nothing has to be copied.
+#
+# THE ONE RULE: every change to a gate goes through _checkpoint() first,
+# then ends at _gates_changed(). That is what makes undo reliable and
+# what keeps the tree, the masks, the plot and the statistics in step —
+# see the "Changing gates" section, which exists solely to funnel them.
+#
+# Events are never read on the GUI thread. Samples open from their
+# headers instantly; SampleLoader reads the events behind the scenes and
+# anything needing them calls wait_for() first.
+# ---------------------------------------------------------------------------
+
 from __future__ import annotations
 import json
 import numpy as np
@@ -46,6 +80,8 @@ from ..core.gates import (
 from ..core import protocol, analysis
 from .errors import show_error
 
+#: Snapshots kept per sample. Each is the gate tree as plain data, not
+#: the events, so this is cheap even on a large file.
 UNDO_LIMIT = 50
 WORKSPACE_FILTER = "FlowPy Workspace (*.fpw)"
 
@@ -62,6 +98,10 @@ def open_window(workspace: str | None = None, fcs: list | None = None,
                 near=None):
     """A new FlowPy window, optionally opening a workspace or FCS files in
     it. A workspace already open in a window brings that window forward."""
+    # Compared resolved, so a symlink, a relative path and a path
+    # through /private on macOS are all recognised as the same file —
+    # the same workspace open twice in two windows would mean two sets
+    # of edits silently overwriting each other on save.
     if workspace:
         target = Path(workspace).resolve()
         for w in _WINDOWS:
@@ -71,9 +111,13 @@ def open_window(workspace: str | None = None, fcs: list | None = None,
                 w.activateWindow()
                 return w
     w = MainWindow()
+    # Offset from the window that spawned it, so a new window does not
+    # land exactly on top of the old one and look like the same one.
     if near is not None:
         g = near.geometry()
         w.setGeometry(g.translated(30, 30))
+    # Shown before loading: a large workspace takes seconds to read, and
+    # an empty window that then fills is better than no window at all.
     w.show()
     if workspace:
         w.load_workspace_file(workspace)
@@ -709,6 +753,7 @@ class MainWindow(QMainWindow):
         """Opening FCS files while a workspace is open: add them to it, or
         open them in a new window (the open one stays as it is)? Returns
         "add", "new" or None (cancelled)."""
+        # An empty window has nothing to protect, so it never asks.
         if not self._samples:
             return "add"
         name = self._doc_path.stem if self._doc_path else "this workspace"
@@ -723,8 +768,15 @@ class MainWindow(QMainWindow):
         add_btn = box.addButton(f"Add to {name}",
                                 QMessageBox.ButtonRole.ActionRole)
         box.addButton(QMessageBox.StandardButton.Cancel)
+        # New Window is the default: adding merges two sets of samples
+        # into one workspace, which cannot be undone, whereas a new
+        # window can simply be closed.
         box.setDefaultButton(new_btn)
         box.exec()
+        # Compared by identity, not by text: the "Add to …" label
+        # contains the workspace name, so there is no fixed string to
+        # match against, and the standard-button enum does not cover
+        # these two custom buttons.
         if box.clickedButton() is add_btn:
             return "add"
         if box.clickedButton() is new_btn:
@@ -759,6 +811,9 @@ class MainWindow(QMainWindow):
         Cancel). No screen updates per file. *loader(item)* builds one
         sample (default: Sample(path)). Returns (sample or None per item,
         error messages)."""
+        # Imported here rather than at module level: this is the only
+        # method that needs them, and keeping them out of the top of the
+        # file takes them off the startup path of every launch.
         from concurrent.futures import ThreadPoolExecutor, wait, \
             FIRST_COMPLETED
         from PyQt6.QtWidgets import QProgressDialog
@@ -767,6 +822,8 @@ class MainWindow(QMainWindow):
         errors: list[str] = []
         prog = QProgressDialog(title, "Cancel", 0, n, self)
         prog.setWindowModality(Qt.WindowModality.WindowModal)
+        # Nothing appears for the first 400 ms, so opening two small
+        # files does not flash a progress dialog on and off screen.
         prog.setMinimumDuration(400)
         prog.setAutoClose(True)
         done = 0
@@ -779,12 +836,25 @@ class MainWindow(QMainWindow):
                     item, dict) else item)
             except (OSError, TypeError, KeyError):
                 return 0
+        # Byte totals, so the dialog can report MB/s rather than a file
+        # count — files vary hugely in size, and "3 / 50" tells you
+        # nothing about how long the remaining 47 will take.
         sizes = [size_of(p) for p in paths] if show_speed else [0] * n
         total, read_bytes, t0 = sum(sizes), 0, time.perf_counter()
+        # Four at a time: reading FCS files is I/O- and numpy-bound, so
+        # it does parallelise, but more threads than this only compete
+        # for the same disk. min(4, n) avoids starting four workers to
+        # read one file.
         with ThreadPoolExecutor(max_workers=min(4, n)) as ex:
+            # future -> original index, so results can be put back in the
+            # order the caller gave regardless of which finishes first.
             futs = {ex.submit(loader, p): i for i, p in enumerate(paths)}
             pending = set(futs)
             while pending:
+                # A short timeout rather than waiting outright: the loop
+                # has to come back every 50 ms to repaint the dialog and
+                # to notice Cancel, even while every file is still being
+                # read.
                 finished, pending = wait(pending, timeout=0.05,
                                          return_when=FIRST_COMPLETED)
                 for f in finished:
@@ -792,6 +862,9 @@ class MainWindow(QMainWindow):
                     try:
                         out[i] = f.result()
                     except Exception as exc:
+                        # One unreadable file must not abandon the other
+                        # forty-nine: it is collected as a message and
+                        # left as None in the results.
                         item = paths[i]
                         name = Path(item["filepath"] if isinstance(item, dict)
                                     else item).name
@@ -801,8 +874,14 @@ class MainWindow(QMainWindow):
                 prog.setValue(done)
                 prog.setLabelText(f"{title}  {done} / {n}" + _speed_note(
                     read_bytes, total, time.perf_counter() - t0))
+                # The reading happens in threads, but this loop is on the
+                # GUI thread; without pumping events by hand the dialog
+                # would never repaint and Cancel would never register.
                 QApplication.processEvents()
                 if prog.wasCanceled():
+                    # cancel() only stops files not yet started — a read
+                    # already running cannot be interrupted, so the
+                    # executor's __exit__ still waits for those.
                     for f in pending:
                         f.cancel()
                     errors.append(f"Cancelled — {n - done} file(s) not "
@@ -820,6 +899,10 @@ class MainWindow(QMainWindow):
         import time
         t0 = time.perf_counter()
         # headers only (instant); events are read in the background
+        # — lazy=True reads just the FCS text segment, so the channel
+        # names and event count are known at once and a folder of large
+        # files appears in the list immediately instead of after a
+        # minute of reading.
         samples, errors = self._read_samples(
             paths, "Opening FCS files…",
             loader=lambda p: Sample(p, lazy=True), show_speed=False)
@@ -827,6 +910,9 @@ class MainWindow(QMainWindow):
         self._samples.extend(loaded)
         self._update_sample_labels()
         if loaded:
+            # first= puts the sample about to be displayed at the head of
+            # the queue, so the plot can be drawn without waiting for the
+            # other forty-nine files to be read.
             self._loader.enqueue(loaded, first=loaded[0])
             self._sample_list.select_sample(loaded[0])
             self._schedule_autosave()
@@ -836,6 +922,9 @@ class MainWindow(QMainWindow):
             + (" — reading their events in the background"
                if self._loader.pending() else ""), 8000)
         if errors:
+            # Capped at thirty: pointing a folder-open at the wrong
+            # directory can produce hundreds of errors, and a dialog
+            # taller than the screen has no usable buttons.
             QMessageBox.warning(self, "Some files were not opened",
                                 "\n".join(errors[:30]) +
                                 (f"\n… and {len(errors) - 30} more"
@@ -947,12 +1036,18 @@ class MainWindow(QMainWindow):
 
     def _sample_loaded(self, sample):
         """A sample's events were read in the background."""
+        # Arrives on the GUI thread via a Qt signal, so it is safe to
+        # touch widgets here even though the reading happened elsewhere.
         self._sample_list.refresh_states()
         left = self._loader.pending()
         if left:
             self._status_loading.setText(f"Reading samples… {left} to go")
         else:
             self._status_loading.setText("")
+        # Three tests, all needed: the user may have clicked another
+        # sample, removed this one, or changed the selection while it
+        # was being read — in each case its arrival must not yank the
+        # plot away from whatever they are now looking at.
         if sample is self._waiting_for and sample in self._samples \
                 and self._sample_list.current_sample() is sample:
             if sample.load_error:
@@ -967,6 +1062,10 @@ class MainWindow(QMainWindow):
     def _ensure_loaded(self, samples, title: str) -> bool:
         """Wait (with progress and Cancel) until *samples* have their
         events. Samples that can't be read are reported and left out."""
+        # The one place the GUI deliberately blocks: an export or a
+        # batch analysis cannot proceed on headers alone, so it waits
+        # here with a progress dialog rather than producing a result
+        # from samples that are only half read.
         if not self._loader.wait_for(samples, self, title):
             return False
         bad = [s for s in samples if s.load_error]
@@ -986,7 +1085,13 @@ class MainWindow(QMainWindow):
         of the population currently shown."""
         if self._current_sample is None or not gates:
             return
+        # A list, not one gate: drawing a quadrant produces four gates
+        # that are one action to the user and so one undo step.
         self._checkpoint()
+        # The selected population becomes the parent, which is what
+        # makes gating hierarchical: whatever is shown in the plot is
+        # what a new gate is drawn inside. No selection means a root
+        # gate, applied to all events.
         parent_gate = self._gate_by_id(self._selected_gate_id)
         parent_mask = (self._gate_masks.get(parent_gate.gate_id)
                        if parent_gate else None)
@@ -1013,9 +1118,15 @@ class MainWindow(QMainWindow):
         its child gates (new gates are drawn inside it)."""
         gate = self._gate_by_id(gate_id)
         self._selected_gate_id = gate.gate_id if gate else None
-        # Show the axes of this population's own gates, if it has any
+        # Show the axes of this population's own gates, if it has any —
+        # following a gating tree means each population is usually
+        # looked at on the axes its children were drawn on, so jumping
+        # there saves setting them by hand at every level.
         if gate is not None and gate.children:
             first = gate.children[0]
+            # A gate with no y channel is one-dimensional, so the plot
+            # has to be a histogram to show it at all; conversely a 2-D
+            # gate cannot be drawn on a histogram, so switch back.
             if first.y_channel is None:
                 self._plot.set_plot_type("Histogram")
             elif self._plot.is_histogram():
@@ -1036,9 +1147,23 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Changing gates (all through here, so they can be undone)
     # ------------------------------------------------------------------
+    # Every method below follows the same three steps, and the section
+    # exists so that none of them can be written any other way:
+    #
+    #     self._checkpoint()      snapshot, for undo
+    #     ...change the tree...
+    #     self._gates_changed()   recompute masks, refresh, autosave
+    #
+    # A gate changed outside this funnel would leave the masks stale —
+    # and a stale mask is not a visible bug, it is a plot and a count
+    # that quietly disagree with the gate drawn on top of them.
+    # ------------------------------------------------------------------
 
     def _gates_changed(self, message: str = ""):
         """Recompute masks and refresh after any change to the gate tree."""
+        # The selected gate may have just been deleted, or replaced by
+        # a new object after an undo; clear the selection rather than
+        # leave it pointing at an id that is no longer in the tree.
         live = self._all_gate_ids()
         if self._selected_gate_id not in live:
             self._selected_gate_id = None
@@ -1052,16 +1177,24 @@ class MainWindow(QMainWindow):
         if gate is None:
             return
         self._checkpoint()
+        # A gate is either a child of another gate or a root; there is no
+        # single container holding both, so the two cases are removed
+        # differently. Deleting a parent takes its children with it,
+        # which is what the gating hierarchy means.
         if gate.parent is not None:
             gate.parent.remove_child(gate)
         else:
             self._root_gates.remove(gate)
         self._plot.select_gate(None)
+        # The message names the way back, because deleting a parent
+        # silently removes a whole branch of the tree.
         self._gates_changed(f"Deleted '{gate.name}' — Edit → Undo "
                             "(Ctrl/⌘+Z) brings it back")
 
     def _rename_gate(self, gate_id: str, new_name: str):
         gate = self._gate_by_id(gate_id)
+        # No change, no checkpoint: committing an unchanged edit would
+        # push a useless entry onto the undo stack.
         if gate is None or gate.name == new_name:
             return
         self._checkpoint()
@@ -1070,6 +1203,11 @@ class MainWindow(QMainWindow):
 
     def _modify_gates(self, changes: list):
         """Apply [(gate, {attribute: value})] from dragging or a dialog."""
+        # Attribute changes rather than new gate objects, so a gate keeps
+        # its identity: its id, its children and its place in the tree all
+        # survive being dragged. One checkpoint for the whole list, since
+        # a single drag that moves four quadrant gates is one action to
+        # undo, not four.
         if not changes:
             return
         self._checkpoint()
@@ -1197,6 +1335,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _snapshot(self, sample) -> tuple:
+        """The gate tree as plain data, plus what was selected.
+
+        Serialised rather than copied, so the snapshot cannot share a
+        Gate object with the live tree and be mutated through it. The
+        selection is included because undoing a gate's creation should
+        also put the selection back where it was.
+        """
         return (protocol.tree_to_dict(sample.gates), self._selected_gate_id)
 
     def _checkpoint(self, sample=None):
@@ -1204,13 +1349,21 @@ class MainWindow(QMainWindow):
         sample = sample or self._current_sample
         if sample is None:
             return
+        # Stored on the sample itself, through __dict__ so that no
+        # attribute has to be declared on the Sample class: each sample
+        # carries its own history, and switching sample switches which
+        # history Cmd-Z walks.
         undo = sample.__dict__.setdefault("undo_stack", [])
         undo.append(self._snapshot(sample))
+        # Trim from the front; the slice handles a short stack with no
+        # length check.
         del undo[:-UNDO_LIMIT]
+        # A new action abandons the redo branch.
         sample.__dict__["redo_stack"] = []
         self._mark_dirty()
 
     def _restore(self, snap: tuple):
+        """Put a snapshot back and let everything redraw from it."""
         tree, selected = snap
         s = self._current_sample
         s.gates = protocol.tree_from_dict(tree)
@@ -1242,6 +1395,13 @@ class MainWindow(QMainWindow):
                                self._gate_by_id(self._selected_gate_id))
 
     def _refresh_after_gate_change(self):
+        """Push the current gates out to every widget that shows them.
+
+        The single place the five views are brought back into step —
+        tree, plot, statistics, layout and the sample list's gate
+        counts. Called from _gates_changed() and from anything else
+        that alters the tree, so no caller has to remember the list.
+        """
         n_total = (self._current_sample.n_events
                    if self._current_sample else 0)
         self._gate_tree.set_gates(self._root_gates, self._gate_masks, n_total)
@@ -1253,7 +1413,10 @@ class MainWindow(QMainWindow):
         self._update_sample_labels()
 
     def _update_sample_labels(self):
+        """Regroup the sample list under whichever metadata column is used."""
         # grouped by the first metadata column that is filled in
+        # — grouping by an empty column would put every sample under
+        # one meaningless heading.
         col = next((c for c in self._meta_columns
                     if any(s.annotations.get(c) for s in self._samples)),
                    None)
@@ -1266,6 +1429,13 @@ class MainWindow(QMainWindow):
             "see the Layout tab", 4000)
 
     def _gate_by_id(self, gate_id: str | None) -> Gate | None:
+        """Find a gate in the current sample's tree by its id.
+
+        Gates are referred to by id rather than by object throughout the
+        window, because undo rebuilds the tree from a snapshot and every
+        Gate object is then a new one — a stored reference would point
+        at a gate that is no longer in the tree.
+        """
         if gate_id is None:
             return None
         for g in _bfs(self._root_gates):
@@ -1274,6 +1444,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _all_gate_ids(self) -> set[str]:
+        """Every id in the current tree, for spotting stale references."""
         return {g.gate_id for g in _bfs(self._root_gates)}
 
     # ------------------------------------------------------------------
@@ -1292,6 +1463,10 @@ class MainWindow(QMainWindow):
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             matrix = dlg.get_matrix()
+            # Compensation rewrites the event values themselves, so every
+            # gate now sees different numbers and every mask has to be
+            # computed again — a gate drawn before compensation keeps its
+            # coordinates but no longer contains the same cells.
             self._current_sample.apply_compensation(matrix)
             self._recompute_all_masks()
             self._schedule_autosave()
@@ -1300,6 +1475,7 @@ class MainWindow(QMainWindow):
                 f"{self._current_sample.n_events:,} events | Compensated")
 
     def _remove_compensation(self):
+        """Back to the uncompensated values, masks recomputed."""
         if self._current_sample is None:
             return
         self._current_sample.remove_compensation()
@@ -1309,8 +1485,13 @@ class MainWindow(QMainWindow):
         """Recompute all gate masks after compensation change."""
         if self._current_sample is None:
             return
+        # compute_masks walks the tree from the roots down, so each
+        # child is evaluated against its parent's mask rather than
+        # against all events — that is what makes a gate hierarchy mean
+        # "inside the parent" instead of just "inside this shape".
         self._gate_masks = protocol.compute_masks(self._current_sample,
                                                   self._root_gates)
+        # The statistics are cached per population; they are now stale.
         self._stats.invalidate()
         self._refresh_after_gate_change()
 
@@ -1319,7 +1500,18 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _workspace_dict(self) -> dict:
+        """The whole window as JSON-safe data.
+
+        Used for both Save and autosave, so there is one definition of
+        what a workspace contains and the recovery copy can never drift
+        from the real file format. Note what is *not* here: the events.
+        A workspace stores the path to each FCS file and the decisions
+        made about it, so it stays a few kilobytes next to gigabytes of
+        data — and so re-opening it re-reads the original files rather
+        than trusting a copy of them.
+        """
         return {
+            # Bumped when the format changes; the loader branches on it.
             "version": 2,
             "saved": datetime.now().isoformat(timespec="seconds"),
             # each sample carries its own gate tree
@@ -1337,6 +1529,10 @@ class MainWindow(QMainWindow):
         }
 
     def _write_workspace(self, path: Path):
+        """Write the workspace, atomically."""
+        # Same .tmp-then-replace as the autosave: a save interrupted
+        # halfway must not destroy the previous good file, which may be
+        # the only record of an afternoon's gating.
         tmp = path.with_name(path.name + ".tmp")
         with open(tmp, "w") as f:
             json.dump(self._workspace_dict(), f)
@@ -1351,12 +1547,15 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             show_error(self, "Save Error", exc)
             return False
+        # The work is now in a file the user chose and can find again,
+        # so the recovery copy has nothing left to recover.
         self._drop_recovery_copy()
         self._set_clean()
         self._statusbar.showMessage(f"Saved {self._doc_path.name}", 3000)
         return True
 
     def _drop_recovery_copy(self):
+        """Delete this window's session file; there is nothing to recover."""
         self._autosave_timer.stop()
         if self._session_path is not None:
             self._session_path.unlink(missing_ok=True)
@@ -1369,6 +1568,9 @@ class MainWindow(QMainWindow):
                                               start, WORKSPACE_FILTER)
         if not path:
             return False
+        # The extension is added rather than assumed: the file dialog
+        # does not append it on every platform, and a workspace saved
+        # without it would not be offered by the Open dialog's filter.
         path = Path(path if path.lower().endswith(".fpw") else path + ".fpw")
         try:
             self._write_workspace(path)
@@ -1391,14 +1593,22 @@ class MainWindow(QMainWindow):
             if self._doc_path else "", WORKSPACE_FILTER)
         if not path:
             return
+        # "Empty" means no samples AND no file: a window whose samples
+        # were all removed is still that document, so opening a
+        # workspace into it would quietly replace what it is.
         if self._samples or self._doc_path is not None:
             open_window(workspace=path, near=self)
         else:
             self.load_workspace_file(path)
 
     def _new_workspace(self):
+        """Empty this window back to a fresh workspace."""
         if not self._confirm_discard():
             return
+        # The background reader is stopped first and deliberately: it
+        # holds references to samples that are about to be discarded,
+        # and a file finishing after the clear would deliver its events
+        # to a sample no longer in the window.
         self._autosave_timer.stop()
         self._loader.clear()
         self._waiting_for = None
@@ -1409,6 +1619,9 @@ class MainWindow(QMainWindow):
         self._plot.set_sample(None)
         self._stats.set_sample(None)
         self._layout.load_dict({})
+        # A fresh copy of the defaults, not the module's list itself —
+        # the columns are edited in place, which would otherwise change
+        # the defaults for every window opened afterwards.
         self._meta_columns = list(groups_core.DEFAULT_COLUMNS)
         self._groups.load_dict({})
         self._refresh_after_gate_change()
@@ -1421,11 +1634,18 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _update_title(self):
+        """Window title, with the platform's unsaved-changes marker."""
         name = self._doc_path.name if self._doc_path else "Untitled"
+        # "[*]" is a Qt placeholder, not literal text: it becomes the
+        # host platform's own convention for an edited document — a dot
+        # in the close button on macOS, an asterisk on Windows.
         self.setWindowTitle(f"{name}[*] — FlowPy")
         self.setWindowModified(self._dirty)
 
     def _mark_dirty(self):
+        # The second half of the test is not just an optimisation: it
+        # keeps the title from being rebuilt on every one of the
+        # hundreds of changes a drag produces.
         if not self._loading and not self._dirty:
             self._dirty = True
             self._update_title()
@@ -1436,6 +1656,8 @@ class MainWindow(QMainWindow):
 
     def _confirm_discard(self) -> bool:
         """Before replacing the analysis: offer to save unsaved changes."""
+        # Returns True meaning "go ahead", so an empty or unmodified
+        # window proceeds without a dialog.
         if not self._samples or not self._dirty:
             return True
         box = QMessageBox(self)
@@ -1460,11 +1682,16 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.StandardButton.Save:
             return self._save_workspace()
         if answer == QMessageBox.StandardButton.Discard:
+            # Discard still writes the recovery copy. The user is saying
+            # they don't want this in their file, not that they want it
+            # gone beyond recall — which is why both dialog texts above
+            # name File → Recover Last Unsaved Session.
             self._flush_autosave()
             return True
         return False
 
     def load_workspace_file(self, path: str):
+        """Read a .fpw (or a recovery copy) into this window."""
         try:
             with open(path) as f:
                 ws = json.load(f)
@@ -1475,8 +1702,14 @@ class MainWindow(QMainWindow):
         # Opening a recovery copy starts a new unsaved analysis from it;
         # opening a workspace makes it the file being edited
         recovered = SESSIONS_DIR in path.parents
+        # A recovered session has no document path, so the next Save
+        # asks where to put it. Saving straight back over the recovery
+        # copy would leave the work in a folder nobody looks in.
         self._doc_path = None if recovered else path
         self._session_path = None
+        # Suppresses _mark_dirty throughout: every set() below would
+        # otherwise mark the workspace modified, so a file would appear
+        # unsaved the instant it was opened.
         self._loading = True
         try:
             # Re-load samples, each with its own gates
@@ -2206,6 +2439,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _schedule_autosave(self):
+        """Something changed: mark it unsaved and restart the timer.
+
+        The _loading guard matters — opening a workspace sets everything
+        it contains, and without it the act of opening a file would mark
+        it as modified.
+        """
         if not self._loading:
             self._mark_dirty()
             self._autosave_timer.start()
@@ -2223,6 +2462,11 @@ class MainWindow(QMainWindow):
             return
         try:
             SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+            # One session file per window, chosen once and kept. The
+            # loop below steps past both files already on disk and paths
+            # claimed by another open window, since two windows opened
+            # in the same second would otherwise share a name and
+            # overwrite each other's recovery copy.
             if self._session_path is None:
                 stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 n = 1                     # several windows: never the same file
@@ -2232,6 +2476,10 @@ class MainWindow(QMainWindow):
                         for w in _WINDOWS):
                     n += 1
                     self._session_path = SESSIONS_DIR / f"session_{stamp}_{n}.fpw"
+            # Written to one side and moved into place. replace() is
+            # atomic on every platform FlowPy runs on, so an autosave
+            # interrupted halfway cannot leave a truncated recovery file
+            # where the last good one used to be.
             tmp = self._session_path.with_suffix(".tmp")
             with open(tmp, "w") as f:
                 json.dump(self._workspace_dict(), f, indent=2)
@@ -2242,6 +2490,9 @@ class MainWindow(QMainWindow):
                 else "Recovery copy saved — use File → Save As to name "
                 "this workspace", 2500)
         except Exception as exc:
+            # Never raise out of an autosave: it fires on a timer, so an
+            # unwritable disk would otherwise interrupt the user
+            # repeatedly while they are working.
             self._statusbar.showMessage(f"Autosave failed: {exc}", 5000)
 
     def _restore_last_session(self):
@@ -2293,12 +2544,21 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geom)
 
     def closeEvent(self, event):
+        """Offer to save, remember the geometry, stop the reader."""
+        # ignore() cancels the close, which is how Cancel in the
+        # save prompt keeps the window open.
         if not self._confirm_discard():
             event.ignore()
             return
         settings = QSettings("FlowPy", "FlowPy")
         settings.setValue("geometry", self.saveGeometry())
+        # The reader is stopped before the window goes: its thread
+        # signals back into these widgets, and delivering a sample to a
+        # destroyed window crashes rather than raising.
         self._loader.stop()
+        # Dropping the last reference is what finally allows the window
+        # to be collected — _WINDOWS is the only thing keeping it alive,
+        # since nothing else holds a reference to a top-level window.
         if self in _WINDOWS:
             _WINDOWS.remove(self)
         super().closeEvent(event)

@@ -32,7 +32,14 @@ from __future__ import annotations
 # One cool-neutral grey ramp, one blue accent, and semantic colours. The
 # light and dark sets carry the same keys so every rule below works for both.
 
+# The names are roles, not colours: a rule below asks for "surface" or
+# "border2", never for a hex value. That is what lets one stylesheet
+# serve both modes — and why self_check() insists the two dicts carry
+# exactly the same keys, since a key present in only one would raise a
+# KeyError the moment someone switched theme.
 LIGHT = dict(
+    # bg is the window, surface a card on it, surface2/3 progressively
+    # recessed areas within a card.
     bg="#F4F6F9", surface="#FFFFFF", surface2="#F7F9FC", surface3="#EEF2F7",
     border="#E3E8EF", border2="#CBD4E1", border3="#94A3B8",
     text="#0F172A", text2="#334155", muted="#64748B", faint="#94A3B8",
@@ -45,6 +52,10 @@ LIGHT = dict(
     plot_line="#334155",
 )
 
+# Not an inversion of LIGHT. Dark surfaces get LIGHTER as they come
+# forward, where light surfaces get darker, because on a dark ground
+# light reads as nearer; and the accents are lifted, since a saturated
+# blue that is legible on white disappears on near-black.
 DARK = dict(
     bg="#0E1116", surface="#161A21", surface2="#1C2129", surface3="#232833",
     border="#272D38", border2="#39414F", border3="#55606F",
@@ -58,6 +69,9 @@ DARK = dict(
     plot_line="#C7CEDA",
 )
 
+# A fallback chain rather than one font: each entry is the native UI
+# face of a platform, so the apps look native on macOS and on Windows
+# without shipping a font or testing for the OS.
 FONT = ('"SF Pro Text", "Inter", "Segoe UI Variable Text", "Segoe UI", '
         '"Helvetica Neue", Arial, sans-serif')
 MONO = ('"SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, '
@@ -70,6 +84,8 @@ DEFAULT_DPI = 600
 
 def tokens(dark: bool = False) -> dict:
     """The colour tokens for one mode, as a plain dict."""
+    # A copy, not the module's dict: callers treat the result as theirs
+    # and a mutation would change the theme for the whole application.
     return dict(DARK if dark else LIGHT)
 
 
@@ -78,12 +94,23 @@ def tokens(dark: bool = False) -> dict:
 # --------------------------------------------------------------------------
 
 def plot_colors(dark: bool = False) -> dict:
+    """The subset of tokens a matplotlib figure needs, renamed.
+
+    Figures are styled from the same tokens as the widgets, which is
+    what keeps a plot from looking pasted into the window — and means a
+    change to the ramp moves both at once.
+    """
     t = tokens(dark)
     return dict(bg=t["plot_bg"], text=t["plot_text"], grid=t["plot_grid"],
                 line=t["plot_line"], surface=t["surface"])
 
 
 #: Categorical palettes shared by the apps' graphs.
+# Categorical, so adjacent entries are chosen to differ in hue AND in
+# lightness — a reader photocopying a figure, or a colour-blind reader,
+# still gets two distinguishable series. "Colour-blind safe" is
+# Okabe-Ito, which is designed for that case rather than adjusted for
+# it.
 PALETTES = {
     "Modern": ["#2563EB", "#F97316", "#15803D", "#A855F7", "#DC2626",
                "#0891B2", "#CA8A04", "#DB2777", "#475569", "#65A30D"],
@@ -103,9 +130,15 @@ PALETTE_NAMES = list(PALETTES)
 
 def palette_colors(name: str, n: int) -> list:
     """*n* colours from a named palette, cycling if more are asked for."""
+    # `or`, not a default argument to get(): a palette name that is
+    # present but empty would otherwise return an empty list and every
+    # series would come out black.
     base = PALETTES.get(name) or PALETTES["Modern"]
     if n <= 0:
         return []
+    # Modulo, so asking for more colours than the palette holds cycles
+    # rather than raising. Twelve groups on a ten-colour palette repeat
+    # two colours, which is better than no plot at all.
     return [base[i % len(base)] for i in range(n)]
 
 
@@ -118,9 +151,15 @@ def mpl_rc(dark: bool = False, base_size: float = 10.0) -> dict:
         "text.color": c["text"], "axes.labelcolor": c["text"],
         "xtick.color": c["text"], "ytick.color": c["text"],
         "axes.edgecolor": c["line"], "grid.color": c["grid"],
+        # Top and right spines off, grid on the y axis only: the
+        # conventions of a published figure rather than matplotlib's
+        # defaults, so a plot is ready to go into a paper unedited.
         "axes.spines.top": False, "axes.spines.right": False,
         "axes.grid": True, "axes.grid.axis": "y", "grid.linewidth": 0.7,
+        # Gridlines behind the data, not drawn over the points.
         "axes.axisbelow": True,
+        # Sizes derived from base_size rather than fixed, so one
+        # argument scales the whole figure's typography coherently.
         "font.size": base_size, "axes.titlesize": base_size + 2,
         "axes.titleweight": "bold", "axes.labelsize": base_size,
         "xtick.labelsize": base_size - 1, "ytick.labelsize": base_size - 1,
@@ -141,6 +180,10 @@ def stylesheet(dark: bool = False, scale: float = 1.0) -> str:
     *scale* multiplies the font sizes, for people who want larger text.
     """
     t = tokens(dark)
+    # Every font size in the sheet below goes through f(), so *scale*
+    # reaches all of them from one place. A lambda because it is used
+    # some hundred times in the f-string that follows, where a def
+    # would read worse; noqa silences the style checker about that.
     f = lambda px: f"{round(px * scale, 1)}px"       # noqa: E731
     return f"""
 /* ---------------------------------------------------------------- base */
@@ -422,6 +465,10 @@ def apply(app, dark: bool = False, scale: float = 1.0) -> None:
     Works with either Qt binding — nothing here imports Qt.
     """
     app.setStyleSheet(stylesheet(dark, scale))
+    # matplotlib is optional here and the import is deliberately inside
+    # the try: this module is also used by tools that have no plotting,
+    # and a missing matplotlib must not stop an application being
+    # styled.
     try:
         import matplotlib
         matplotlib.rcParams.update(mpl_rc(dark))
@@ -431,13 +478,24 @@ def apply(app, dark: bool = False, scale: float = 1.0) -> None:
 
 def self_check() -> None:
     """Both token sets carry the same keys, and every token is used."""
+    # Symmetric difference: catches a key added to one mode and
+    # forgotten in the other, which is the one mistake in this file
+    # that would otherwise surface as a KeyError in front of a user,
+    # and only on whichever theme they happened to be using.
     missing = set(LIGHT) ^ set(DARK)
     assert not missing, f"token sets differ: {sorted(missing)}"
     for dark in (False, True):
         css = stylesheet(dark)
         assert "{" not in css.split("/*")[0] or True
+        # A missing token does not raise when it is interpolated into
+        # an f-string — it lands in the CSS as the text "None" or as a
+        # dict repr, and Qt then silently ignores that rule. Searching
+        # the built sheet for those strings is what turns such a
+        # mistake into a failure.
         for bad in ("None", "{'", "KeyError"):
             assert bad not in css, bad
+    # 14 from a 10-colour palette checks the cycling; "nope" checks
+    # that an unknown name falls back instead of raising.
     assert len(palette_colors("Modern", 14)) == 14
     assert palette_colors("nope", 2) == PALETTES["Modern"][:2]
     assert mpl_rc()["axes.grid"] is True

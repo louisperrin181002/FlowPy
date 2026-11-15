@@ -24,8 +24,14 @@ FUNCTIONS = {
     "asinh": np.arcsinh,
     "min": np.minimum, "max": np.maximum,
 }
+#: The only operators a formula may use. Mapping them to numpy functions
+#: rather than evaluating the AST directly is what keeps this an
+#: allow-list: an operator missing from here raises instead of running.
 _BIN = {ast.Add: np.add, ast.Sub: np.subtract, ast.Mult: np.multiply,
         ast.Div: np.divide, ast.Pow: np.power}
+
+#: [channel name]. Non-greedy on the inside so two channels on one line
+#: do not merge into a single match.
 _CHANNEL = re.compile(r"\[([^\[\]]+)\]")
 
 
@@ -39,6 +45,13 @@ def channels_in(expr: str) -> list[str]:
 
 
 def _parse(expr: str) -> tuple[ast.Expression, dict[str, str]]:
+    """Check a formula and return its syntax tree and channel names.
+
+    Channel names are swapped for plain identifiers (_c0, _c1…) before
+    parsing, because "YG5-A" is not valid Python — read as an expression
+    it would be the name YG5 minus the name A. The mapping back is
+    returned alongside the tree.
+    """
     names: dict[str, str] = {}
 
     def sub(m):
@@ -54,6 +67,12 @@ def _parse(expr: str) -> tuple[ast.Expression, dict[str, str]]:
     except SyntaxError:
         raise FormulaError("The formula isn't valid — check brackets and "
                            "operators.") from None
+    # Walk every node and refuse anything not on the allow-list. This is
+    # the whole security boundary: a formula is typed by the user and
+    # saved into a workspace, so it travels between machines, and eval()
+    # on it would run whatever it contained. Attribute access, imports,
+    # subscripts and comparisons are all absent from the list below and
+    # so all rejected.
     for node in ast.walk(tree):
         ok = isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp,
                                ast.Constant, ast.Name, ast.Call, ast.Load,
@@ -69,6 +88,8 @@ def _parse(expr: str) -> tuple[ast.Expression, dict[str, str]]:
             raise FormulaError(f"Unknown name '{node.id}' — put channel "
                                "names in square brackets, e.g. [YG5-A].")
         if isinstance(node, ast.Call):
+            # Only a bare name from FUNCTIONS may be called, and with no
+            # keyword arguments: both rule out reaching anything else.
             if not (isinstance(node.func, ast.Name)
                     and node.func.id in FUNCTIONS) or node.keywords:
                 raise FormulaError("Allowed functions: "
@@ -110,14 +131,21 @@ def evaluate(expr: str, column) -> np.ndarray:
             return FUNCTIONS[node.func.id](*[ev(a) for a in node.args])
         raise FormulaError("Unsupported formula.")
 
+    # Division by zero and log of a negative are ordinary in flow data —
+    # a channel legitimately holds zeros and negatives — so numpy is told
+    # not to warn, and the non-finite results are turned into NaN below.
     with np.errstate(all="ignore"):
         try:
             out = ev(tree)
         except TypeError as exc:     # wrong number of function arguments
             raise FormulaError(str(exc)) from None
     out = np.asarray(out, dtype=np.float64)
+    # NaN rather than inf or a clamped number: NaN is never inside a gate,
+    # so an event whose formula could not be computed is left out of every
+    # population instead of being silently counted in one.
     return np.where(np.isfinite(out), out, np.nan)
 
 
 def ratio_formula(a: str, b: str) -> str:
+    """The formula text for a simple ratio, as the ratio dialog writes it."""
     return f"[{a}] / [{b}]"

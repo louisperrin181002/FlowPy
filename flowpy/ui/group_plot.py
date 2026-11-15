@@ -4,6 +4,33 @@ error bars, lines over a numeric variable (time, dose), optional colouring
 by a second variable, a summary table and a t-test / ANOVA (or their
 non-parametric equivalents)."""
 
+# ---------------------------------------------------------------------------
+# HOW THIS TAB WORKS
+# ---------------------------------------------------------------------------
+# One row per sample, not per event. Everything upstream reduces a whole
+# sample to a single number — "the median of YG5 inside my gate" — and
+# this tab then treats those numbers as ordinary data to group, plot and
+# test. The long table it works from has four columns:
+#
+#     Sample | Group | [Hue] | Value
+#
+# Two halves, deliberately separable:
+#
+#   draw_group_plot()   pure matplotlib, no Qt. Takes that DataFrame and
+#                       a settings object and draws. Being Qt-free is
+#                       what lets the layout/export code reuse it.
+#   GroupPlotWidget     the controls around it, debounced by 150 ms so
+#                       dragging a spin box does not redraw per step.
+#
+# All the state lives in one GroupPlotSettings dataclass, so the whole
+# tab can be saved into a workspace and restored with asdict/from_dict.
+#
+# Positions on the x axis come from `xpos`, which is the one place that
+# decides whether the x axis is categorical (groups evenly spaced) or
+# numeric (a time course laid out to scale). Everything else — bar
+# widths, offsets between hues, jitter — is derived from it.
+# ---------------------------------------------------------------------------
+
 from __future__ import annotations
 from dataclasses import dataclass, asdict, fields
 import numpy as np
@@ -54,6 +81,13 @@ class GroupPlotSettings:
 
     @classmethod
     def from_dict(cls, d: dict) -> "GroupPlotSettings":
+        """Rebuild from saved data, ignoring anything unrecognised.
+
+        Filtering against the current field names is what lets an old
+        workspace open in a newer FlowPy, and a newer one in an older:
+        a setting that no longer exists is dropped rather than raising
+        TypeError and losing the whole file.
+        """
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in (d or {}).items() if k in known})
 
@@ -63,6 +97,12 @@ class GroupPlotSettings:
 # ---------------------------------------------------------------------------
 
 def _jitter(n: int, width: float, seed: int) -> np.ndarray:
+    """Small random x offsets so overlapping points stay countable.
+
+    Seeded, so the same data jitters the same way every redraw — points
+    that danced about between redraws would look like changing data.
+    A single point is left on the centre line rather than nudged off it.
+    """
     if n <= 1:
         return np.zeros(n)
     rng = np.random.default_rng(seed)
@@ -78,26 +118,45 @@ def draw_group_plot(ax, df: pd.DataFrame, st: GroupPlotSettings,
     hues = groups.group_order(list(df["Hue"])) if hue else [None]
     pal = PALETTES.get(st.palette, PALETTES["FlowPy"])
     colors = {h: pal[i % len(pal)] for i, h in enumerate(hues)}
+    # Two ways to place the groups along x — see the note at the top.
+    # Numeric only for the line plot and only when every group label
+    # parses as a number: a time course at 0, 3, 6 and 18 h must be
+    # spaced to scale, while strain names are evenly spaced categories.
+    # The comma swap handles labels written with a decimal comma.
     numeric_x = st.kind == PLOT_KINDS[3] and groups.is_numeric(order)
     xpos = ({g: float(str(g).replace(",", ".")) for g in order}
             if numeric_x else {g: float(i) for i, g in enumerate(order)})
     nh = len(hues)
+    # Everything is sized relative to the *closest* pair of x positions,
+    # so bars never overlap on an unevenly spaced numeric axis (0, 3, 6,
+    # 18 h: the gap of 3 sets the width, not the gap of 12). Categorical
+    # positions are one apart, hence the 1.0 default.
     span = (min(np.diff(sorted(xpos.values()))) if numeric_x and
             len(xpos) > 1 else 1.0)
+    # 80% of that, shared between the hue levels so they sit side by
+    # side. A line plot does not divide: its hues overlap on purpose.
     w = 0.8 * span / (nh if st.kind != PLOT_KINDS[3] else 1)
     test_lines = []
 
     vals_all = df["Value"].to_numpy(float)
     if st.log_y:
+        # A log axis cannot show zero or negative values. They become
+        # NaN so they are dropped from the means and the tests too —
+        # leaving them in would silently compute statistics over points
+        # that are not on the plot.
         df = df.assign(Value=np.where(vals_all > 0, vals_all, np.nan))
 
     for j, h in enumerate(hues):
         sub = df if h is None else df[df["Hue"] == h]
         c = colors[h]
+        # Offset that centres the group of hue levels on its x position:
+        # with three hues the offsets are -w, 0, +w.
         off = 0.0 if st.kind == PLOT_KINDS[3] else (j - (nh - 1) / 2) * w
         xs, means, errs, per_group = [], [], [], {}
         for g in order:
             v = sub.loc[sub["Group"] == g, "Value"].to_numpy(float)
+            # Non-finite values dropped once, here, so the drawing, the
+            # error bars and the test below all see the same numbers.
             v = v[np.isfinite(v)]
             per_group[g] = v
             if not len(v):
@@ -112,6 +171,11 @@ def draw_group_plot(ax, df: pd.DataFrame, st: GroupPlotSettings,
                 ax.bar(x, m, width=w * 0.85, color=c, alpha=0.35,
                        edgecolor=c, linewidth=1.2, zorder=2)
             elif st.kind == PLOT_KINDS[1]:
+                # manage_ticks=False stops boxplot replacing the tick
+                # positions, which are set deliberately further down.
+                # patch_artist makes the box a fillable patch; without
+                # it the facecolor below is ignored. Outliers are off
+                # because every point is drawn anyway.
                 bp = ax.boxplot([v], positions=[x], widths=w * 0.7,
                                 patch_artist=True, showfliers=False,
                                 manage_ticks=False, zorder=2)
@@ -123,6 +187,9 @@ def draw_group_plot(ax, df: pd.DataFrame, st: GroupPlotSettings,
             elif st.kind == PLOT_KINDS[2]:
                 ax.plot([x - w * 0.3, x + w * 0.3], [m, m], color=c,
                         linewidth=2.2, zorder=4)
+            # Points on top of whatever summary was drawn — the honest
+            # default for small n, where a bar alone hides how few
+            # replicates there are.
             if st.show_points and st.kind != PLOT_KINDS[3]:
                 jit = _jitter(len(v), w * 0.18, seed=len(v) + j)
                 ax.scatter(x + jit, v, s=28, color=c, edgecolor="white",
@@ -140,6 +207,10 @@ def draw_group_plot(ax, df: pd.DataFrame, st: GroupPlotSettings,
                     v = per_group.get(g, np.array([]))
                     ax.scatter(np.full(len(v), xpos[g]), v, s=14, color=c,
                                alpha=0.45, linewidth=0, zorder=3)
+        # One test per hue level, comparing that level's groups. Groups
+        # with fewer than two values cannot contribute to a test and are
+        # excluded from the count, so the caption says how many groups
+        # were actually compared rather than how many are drawn.
         name, p = groups.compare(per_group, st.test)
         if name:
             n_groups = sum(len(v) >= 2 for v in per_group.values())
@@ -154,6 +225,9 @@ def draw_group_plot(ax, df: pd.DataFrame, st: GroupPlotSettings,
         ax.set_xlabel(st.group_col)
     else:
         ax.set_xticks([xpos[g] for g in order])
+        # Rotate the labels only when they would collide: the estimate
+        # is the longest label times how many there are, against a rough
+        # budget of 60 characters across the axis.
         long = max((len(str(g)) for g in order), default=0)
         ax.set_xticklabels(order, rotation=30 if long * len(order) > 60
                            else 0, ha="right" if long * len(order) > 60
@@ -164,9 +238,15 @@ def draw_group_plot(ax, df: pd.DataFrame, st: GroupPlotSettings,
     if st.log_y:
         ax.set_yscale("log")
     elif st.kind == PLOT_KINDS[0]:
+        # Bars must start at zero, or their relative heights lie. The
+        # min() lets the axis go below zero when the data does, while
+        # never letting it start above it.
         ax.set_ylim(bottom=min(0, np.nanmin(vals_all)
                                if np.isfinite(vals_all).any() else 0))
     if hue:
+        # Empty scatters used purely as legend proxies: the real artists
+        # are many per level, and legending them directly would list
+        # each group several times.
         handles = [ax.scatter([], [], s=40, color=colors[h]) for h in hues]
         ax.legend(handles, hues, title=st.hue_col, frameon=False,
                   fontsize=8, title_fontsize=8, loc="upper left",
@@ -186,6 +266,12 @@ def draw_group_plot(ax, df: pd.DataFrame, st: GroupPlotSettings,
 # ---------------------------------------------------------------------------
 
 def _search_combo() -> QComboBox:
+    """A combo you can type into to search a long list of channels.
+
+    Same pattern as the derived-parameter dialog: editable for typing,
+    NoInsert so a typo is not added as an entry, and MatchContains
+    because the useful part of a channel name is often in the middle.
+    """
     c = QComboBox()
     c.setEditable(True)
     c.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -209,8 +295,12 @@ class GroupPlotWidget(QWidget):
         self._df = pd.DataFrame()
         self._summary = pd.DataFrame()
         self._dirty = True
-        self._ready = False              # ignore signals while building
-        self._group_chosen = False       # user picked "Group by" themself
+        # Guards. _ready is False while _build_ui() runs, so the widgets
+        # it creates do not trigger a render before the tab exists;
+        # _group_chosen records whether the user picked the grouping
+        # column, so an automatic guess never overrides their choice.
+        self._ready = False
+        self._group_chosen = False
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(150)

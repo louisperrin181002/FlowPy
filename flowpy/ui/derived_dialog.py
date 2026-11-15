@@ -2,6 +2,29 @@
 (e.g. YG5-A / BL1-A) that can be plotted, gated and exported like any
 measured channel."""
 
+# ---------------------------------------------------------------------------
+# HOW THIS DIALOG WORKS
+# ---------------------------------------------------------------------------
+# A list of existing formula channels on the left, an editor on the
+# right. The editor is in one of two states, held in self._editing:
+#
+#     None          -> creating; the button reads "Create Parameter"
+#     "<name>"      -> editing that one; the button reads "Update"
+#
+# _new() and _on_select() are the two ways in and out of those states,
+# and every other method reads _editing to know which it is in.
+#
+# Typing in the formula box does not evaluate immediately. It restarts a
+# 200 ms timer, and only when typing stops does _preview() run the
+# formula over the whole current sample. Without that, every keystroke
+# would evaluate a formula across millions of events.
+#
+# _save() is the only method that writes anything, and it writes to
+# every selected sample. The current sample is deliberately done first,
+# so that a mistake in the formula is reported against the sample the
+# user was looking at rather than whichever happened to be first.
+# ---------------------------------------------------------------------------
+
 from __future__ import annotations
 import numpy as np
 
@@ -21,7 +44,12 @@ def _channel_combo(channels: list[str]) -> QComboBox:
     c = QComboBox()
     c.setEditable(True)
     c.addItems(channels)
+    # Editable so it can be typed into, but NoInsert so that typing a
+    # name that is not a channel does not silently add it to the list.
     c.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+    # MatchContains rather than the default MatchStartsWith: on a
+    # spectral panel the useful part of a name is in the middle, so
+    # typing "mKate" should find "YG5-A (mKate)".
     comp = c.completer()
     comp.setFilterMode(Qt.MatchFlag.MatchContains)
     comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
@@ -30,10 +58,17 @@ def _channel_combo(channels: list[str]) -> QComboBox:
 
 
 def gates_using(samples, name: str) -> list[str]:
-    """'sample: gate' for every gate drawn on channel *name*."""
+    """'sample: gate' for every gate drawn on channel *name*.
+
+    Used before renaming: a gate stores the channel it was drawn on by
+    name, so renaming out from under one would leave it pointing at a
+    channel that no longer exists.
+    """
     out = []
     for s in samples:
         for g in _bfs(s.gates):
+            # getattr with a default because a range gate is
+            # one-dimensional and has no y_channel at all.
             if name in (g.x_channel, getattr(g, "y_channel", None)):
                 out.append(f"{s.name}: {g.name}")
     return out
@@ -51,6 +86,9 @@ class DerivedParameterDialog(QDialog):
         self.changed = False          # read by the main window
         self._editing: str | None = None
 
+        # The debounce behind the live preview — see the note at the top.
+        # setSingleShot means a restart replaces the pending shot rather
+        # than queueing another.
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(200)
@@ -87,6 +125,9 @@ class DerivedParameterDialog(QDialog):
         q = QHBoxLayout(quick)
         self._ratio_a = _channel_combo(chans)
         self._ratio_b = _channel_combo(chans)
+        # Default the quick ratio to two fluorescence channels, since a
+        # ratio of scatter channels is rarely what anyone wants. min()
+        # guards the one-channel case, where both boxes point at it.
         if len(chans) > 1:
             fl = [c for c in current.fluorescence if c in chans] or chans
             self._ratio_a.setCurrentText(fl[0])
@@ -126,6 +167,9 @@ class DerivedParameterDialog(QDialog):
                           ("sqrt", "sqrt("), ("asinh", "asinh(")):
             ob = QPushButton(text)
             ob.setMinimumWidth(64 if len(text) > 1 else 38)
+            # p=put binds the current value into the lambda's default.
+            # Without it every button would close over the same variable
+            # and insert the last operator in the loop.
             ob.clicked.connect(lambda _=False, p=put: self._insert(p))
             ops.addWidget(ob)
         ops.addStretch()
@@ -181,12 +225,25 @@ class DerivedParameterDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _channels(self) -> list[str]:
+        """Channels a formula may refer to.
+
+        The parameter being edited is excluded: a formula that mentions
+        itself would be circular, and the validator would accept it
+        because by then the channel does exist.
+        """
         return [c for c in self._s.channels if c != self._editing]
 
     def _refresh_list(self, select: str | None = None):
+        """Rebuild the list on the left, optionally selecting one entry."""
+        # Signals blocked so that clearing and refilling does not fire
+        # currentItemChanged -> _on_select, which would overwrite the
+        # editor the user is in the middle of typing into.
         self._list.blockSignals(True)
         self._list.clear()
         for name, expr in self._s.formulas.items():
+            # Two lines per row: the name, then its formula indented
+            # underneath. The name alone goes in the item's data, since
+            # the display text is not a usable key.
             it = QListWidgetItem(f"{name}\n   = {expr}")
             it.setData(Qt.ItemDataRole.UserRole, name)
             self._list.addItem(it)
@@ -222,8 +279,12 @@ class DerivedParameterDialog(QDialog):
         self._expr.setFocus()
 
     def _use_ratio(self):
+        """Fill the formula and a sensible name from the two combos."""
         a, b = self._ratio_a.currentText(), self._ratio_b.currentText()
         self._expr.setText(fx.ratio_formula(a, b))
+        # Trim the -A/-H/-W suffix for the *name* only: "YG5/BL1 ratio"
+        # reads better than "YG5-A/BL1-A ratio", while the formula keeps
+        # the full channel names it needs.
         short = lambda c: c[:-2] if c[-2:] in ("-A", "-H", "-W") else c
         self._name.setText(f"{short(a)}/{short(b)} ratio")
 
@@ -239,12 +300,18 @@ class DerivedParameterDialog(QDialog):
             self._preview_lbl.setText(f"<span style='color:#dc2626;'>"
                                       f"{exc}</span>")
             return
+        # Finite values only. A formula frequently produces some NaN —
+        # dividing by zero on a dim event — and those must not reach
+        # np.percentile, which would return NaN for everything.
         ok = v[np.isfinite(v)]
         if not len(ok):
             self._preview_lbl.setText("<span style='color:#dc2626;'>The "
                                       "result is undefined for every "
                                       "event.</span>")
             return
+        # 1st to 99th percentile rather than min to max: one extreme
+        # event would otherwise set the whole range and say nothing about
+        # where the data actually sits.
         lo, med, hi = np.percentile(ok, [1, 50, 99])
         nan = len(v) - len(ok)
         txt = (f"<b>Preview on {self._s.name}:</b> median {med:.4g} · "
@@ -262,6 +329,8 @@ class DerivedParameterDialog(QDialog):
             QMessageBox.information(self, "Derived Parameters",
                                     "Give the parameter a name.")
             return
+        # Renaming is refused while gates depend on the old name — see
+        # gates_using(). Creating and editing in place are both fine.
         old = self._editing
         if old is not None and name != old:
             used = gates_using(self._samples, old)
@@ -272,13 +341,19 @@ class DerivedParameterDialog(QDialog):
                     + "\n".join(used[:10]))
                 return
         targets = self._samples if self._all_cb.isChecked() else [self._s]
-        # current sample first: its error is the one worth showing
+        # Current sample first, then the rest with it removed so it is
+        # not done twice. Its error is the one worth interrupting for:
+        # the others may legitimately lack the channel, and those are
+        # collected into *failed* and reported together at the end.
         targets = [self._s] + [t for t in targets if t is not self._s]
         failed = []
         for i, t in enumerate(targets):
             try:
                 if old is not None and name != old and old in t.formulas:
                     t.remove_derived(old)
+                # Creating something that collides with a *measured*
+                # channel is refused; colliding with an existing formula
+                # is just an edit of it, which is allowed.
                 if old is None and name in t.channels \
                         and name not in t.formulas:
                     raise fx.FormulaError(f"'{name}' is already a channel.")
