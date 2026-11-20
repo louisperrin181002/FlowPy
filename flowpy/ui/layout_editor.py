@@ -5,6 +5,12 @@ and/or several samples (histogram overlays, optionally staggered, or dot-plot
 overlays), style them (colours, colour maps, line widths, axis ranges and
 labels, statistics such as the median marked on the plot, legends) and export
 the page as a high-resolution PNG, PDF or SVG figure.
+
+A panel can also be a table instead of a plot ("Add table"): counts, the
+percentage of total and the chosen statistic, one row per sample x
+population. It resolves its data exactly as a plot panel does, so a table
+placed beside a figure is guaranteed to describe that figure rather than a
+separately chosen set of samples.
 """
 
 from __future__ import annotations
@@ -95,6 +101,10 @@ STYLE_FIELDS = ("colormap", "palette", "dot_size", "opacity", "line_width",
 
 @dataclass
 class LayoutItem:
+    #: "plot" or "table". A table panel resolves its samples and
+    #: populations exactly as a plot does, so a table placed beside a
+    #: figure describes that figure rather than a separately chosen set.
+    kind: str = "plot"
     # default_factory, not a plain default: a mutable default on a
     # dataclass is shared by every instance, so adding a population to
     # one panel would add it to every panel created afterwards.
@@ -276,6 +286,10 @@ class LayoutEditor(QWidget):
 
         row = QHBoxLayout()
         for text, tip, slot in (("Add", "Add a plot", self._add_blank),
+                                ("Add table",
+                                 "Add a table of counts and statistics for "
+                                 "the same samples and populations",
+                                 self._add_table),
                                 ("Duplicate", "Copy selected plot",
                                  self._duplicate),
                                 ("Remove", "Remove selected plot",
@@ -775,7 +789,10 @@ class LayoutEditor(QWidget):
 
     def _refresh_list_labels(self):
         for i, it in enumerate(self._items):
-            what = (it.x_channel if it.plot_type == "Histogram"
+            what = ("table of counts" + (f" and {stat_label(it.stat, it.stat_pct)}"
+                                         if it.stat != NO_STAT else "")
+                    if it.kind == "table"
+                    else it.x_channel if it.plot_type == "Histogram"
                     else "full spectrum" if it.plot_type == "Spectrum"
                     else f"{it.x_channel} / {it.y_channel}")
             self._list.item(i).setText(
@@ -859,6 +876,22 @@ class LayoutEditor(QWidget):
             w.blockSignals(False)
 
     def _sync_enabled(self, item: LayoutItem):
+        # A table has no axes and no drawing style, so those two tabs are
+        # disabled rather than left offering settings that do nothing.
+        table = item.kind == "table"
+        for idx, name in enumerate(("Data", "Style", "Axes", "Labels")):
+            self._props.setTabEnabled(idx, not table or name in
+                                      ("Data", "Labels"))
+        if table:
+            for w in (self._stat_mark_cb, self._count_cb, self._stat_loc,
+                      self._legend_combo):
+                w.setEnabled(False)
+            self._stat_pct.setEnabled(item.stat == "Percentile")
+            self._stat_combo.setEnabled(True)
+            self._show_title_cb.setEnabled(True)
+            return
+        for idx in range(4):
+            self._props.setTabEnabled(idx, True)
         hist = item.plot_type == "Histogram"
         spec = item.plot_type == "Spectrum"
         pseudo = item.plot_type == "Pseudocolor"
@@ -986,6 +1019,28 @@ class LayoutEditor(QWidget):
         self.add_item({"x_channel": fl[0],
                        "y_channel": fl[min(1, len(fl) - 1)]})
 
+    def _add_table(self):
+        """A statistics table over the same data as the current plot.
+
+        Seeded from the selected panel when there is one, so the table
+        lands describing the figure it was asked for next to, rather than
+        a default the user then has to set up twice.
+        """
+        item = self._current_item()
+        if item is not None:
+            spec = asdict(item)
+            spec.update(kind="table", title="", show_title=True)
+            if spec.get("stat") == NO_STAT:
+                spec["stat"] = "Median"
+            return self.add_item(spec)
+        ref = self._current or (self._samples[0] if self._samples else None)
+        if ref is None:
+            return
+        fl = ref.fluorescence or ref.channels
+        self.add_item({"kind": "table", "stat": "Median",
+                       "x_channel": fl[0],
+                       "y_channel": fl[min(1, len(fl) - 1)]})
+
     def _duplicate(self):
         item = self._current_item()
         if item is not None:
@@ -1043,8 +1098,17 @@ class LayoutEditor(QWidget):
         cols = min(page["columns"], max(n, 1))
         rows = max(1, -(-n // cols))
         fig.set_size_inches(pw * cols, ph * rows)
-        dpi = fig.get_dpi()
-        self._canvas.setFixedSize(int(pw * cols * dpi), int(ph * rows * dpi))
+        # Divided by the device pixel ratio, which is the whole point of
+        # this line. On a Retina screen the Qt backend multiplies the
+        # figure's dpi by that ratio, so fig.get_dpi() reports 200 where
+        # the page is 100. Sizing the widget from it made the widget
+        # exactly twice the figure in each direction: matplotlib painted
+        # the top-left quarter and the other three quarters kept whatever
+        # was in the backing store — fragments of earlier renders, which
+        # read on screen as a wall of torn text beside the plots.
+        dpi = fig.get_dpi() / (self._canvas.device_pixel_ratio or 1)
+        self._canvas.setFixedSize(round(pw * cols * dpi),
+                                  round(ph * rows * dpi))
 
         if n == 0 or not self._samples:
             fig.text(0.5, 0.5,
@@ -1058,7 +1122,8 @@ class LayoutEditor(QWidget):
             for i, item in enumerate(self._items):
                 ax = fig.add_subplot(rows, cols, i + 1)
                 try:
-                    self._render_item(ax, item, page["font_size"])
+                    self._render_item(ax, item, page["font_size"],
+                                      (pw, ph))
                 except Exception as exc:  # one bad panel shouldn't kill all
                     ax.cla()
                     ax.text(0.5, 0.5, f"Cannot draw:\n{exc}", ha="center",
@@ -1068,6 +1133,7 @@ class LayoutEditor(QWidget):
                 fig.tight_layout(pad=1.2)
             except Exception:
                 pass
+            self._fit_tables(fig)
         self._canvas.draw()
         self._update_thumbnails()
 
@@ -1117,7 +1183,150 @@ class LayoutEditor(QWidget):
         return [stat_1d(s.column(ch), item.stat, item.stat_pct, lay.mask)
                 for ch in channels]
 
-    def _render_item(self, ax, item: LayoutItem, fs: float = 8):
+    #: Beyond this many rows a table stops being something anyone reads
+    #: off a figure, so the rest are summarised rather than shrunk until
+    #: they are illegible.
+    MAX_TABLE_ROWS = 40
+
+    @staticmethod
+    def _fit_tables(fig):
+        """Settle each table's type size now the axes widths are known.
+
+        tight_layout decides how wide a panel's axes really is, and that
+        is narrower than the panel — by the title, the margins and
+        whatever the neighbouring panels needed. Sizing the text before
+        that is guesswork, and guessing high is what ran one column into
+        the next.
+        """
+        fig_w_pt = fig.get_size_inches()[0] * 72.0
+        for ax in fig.axes:
+            fit = getattr(ax, "_flowpy_table_fit", None)
+            if not fit:
+                continue
+            span, cap = fit
+            if span <= 0:
+                continue
+            avail = ax.get_position().width * fig_w_pt
+            size = max(min(cap, avail / span), 3.0)
+            for t in ax.texts:
+                t.set_fontsize(size)
+
+    @staticmethod
+    def _text_units(text: str, bold: bool = False) -> float:
+        """Width of *text* in multiples of the font size.
+
+        Measured from the font's own outlines rather than counted in
+        characters: in a proportional face "WT" and "ill" are nothing
+        like the same width, and allocating columns by character count
+        is what made them overlap.
+        """
+        from matplotlib.textpath import TextPath
+        from matplotlib.font_manager import FontProperties
+        if not text:
+            return 0.0
+        prop = FontProperties(size=1.0, weight="bold" if bold else "normal")
+        return max(TextPath((0, 0), line, prop=prop).get_extents().width
+                   for line in text.split("\n"))
+
+    def _render_table(self, ax, item: LayoutItem, layers, fs: float,
+                      panel=(3.6, 3.3)):
+        """The numbers behind the plots: one row per sample x population.
+
+        Drawn with text and rectangles rather than ax.table, which sizes
+        its columns from the figure and reflows them whenever the panel
+        is resized. Here the columns are measured once from the text,
+        and the type is shrunk — never the columns overlapped — until
+        the widest row fits the panel.
+        """
+        ax.axis("off")
+        channels = ([item.x_channel] if item.plot_type == "Histogram"
+                    else [item.x_channel, item.y_channel])
+        channels = [c for c in channels if c]
+        stat_name = stat_label(item.stat, item.stat_pct)
+        head = ["Sample", "Population", "Count", "% of total"]
+        if item.stat != NO_STAT:
+            # On two lines: a channel name like "LightLoss (Imaging)-A" is
+            # wider than the column of numbers under it, and one long
+            # header would squeeze every other column to nothing.
+            head += [f"{stat_name}\n{ch}" for ch in channels]
+        #: Columns from here on hold numbers, and numbers line up on the
+        #: right or they cannot be compared down a column.
+        first_numeric = 2
+
+        rows = []
+        for lay in layers:
+            s = lay.sample
+            n = int(lay.mask.sum()) if lay.mask is not None else s.n_events
+            cells = [s.name, lay.gate.name if lay.gate else "All Events",
+                     f"{n:,}",
+                     f"{100.0 * n / s.n_events:.1f}" if s.n_events else "–"]
+            if item.stat != NO_STAT:
+                cells += [_fmt(v) for v in self._stats(item, lay, channels)]
+            rows.append(cells)
+        hidden = max(0, len(rows) - self.MAX_TABLE_ROWS)
+        if hidden:
+            rows = rows[:self.MAX_TABLE_ROWS]
+        if not rows:
+            return
+
+        head_lines = 2 if any("\n" in t for t in head) else 1
+        n_lines = len(rows) + head_lines + (1 if hidden else 0)
+
+        # Column widths in font-size units, then one type size that makes
+        # the whole lot fit across the panel.
+        GAP = 1.4
+        units = [max([self._text_units(head[c], bold=True)]
+                     + [self._text_units(r[c]) for r in rows])
+                 for c in range(len(head))]
+        span = sum(units) + GAP * (len(units) - 1)
+        # A provisional size, from the whole panel. It is almost always
+        # too big, because tight_layout has not run yet and the axes ends
+        # up narrower than the panel it sits in — _fit_tables() below
+        # settles it once the real width is known.
+        cap = min(fs, panel[1] * 72.0 * 0.82 / max(n_lines, 1))
+        size = max(min(cap, panel[0] * 72.0 / span if span else cap), 3.5)
+
+        edges, acc = [], 0.0
+        for u in units:
+            edges.append((acc / span, (acc + u) / span))
+            acc += u + GAP
+
+        h = 1.0 / n_lines
+
+        def put(top: float, col: int, text: str, **kw):
+            right = col >= first_numeric
+            x = edges[col][1] if right else edges[col][0]
+            ax.text(x, top, text, ha="right" if right else "left",
+                    va="center", fontsize=size, transform=ax.transAxes,
+                    linespacing=1.15, **kw)
+
+        from matplotlib.patches import Rectangle
+        body_top = 1.0 - head_lines * h
+        for i in range(len(rows)):
+            if i % 2:
+                ax.add_patch(Rectangle(
+                    (0, body_top - (i + 1) * h), 1, h,
+                    transform=ax.transAxes, facecolor="#f1f5f9",
+                    edgecolor="none", zorder=0))
+        for c, text in enumerate(head):
+            put(1.0 - head_lines * h / 2, c, text, weight="bold")
+        for y in (body_top, body_top - len(rows) * h):
+            ax.plot([0, 1], [y, y], transform=ax.transAxes, color="#334155",
+                    linewidth=0.9, clip_on=False, zorder=2)
+        for i, cells in enumerate(rows):
+            for c, text in enumerate(cells):
+                put(body_top - (i + 0.5) * h, c, text)
+        if hidden:
+            put(body_top - (len(rows) + 0.5) * h, 0,
+                f"(+{hidden} more rows)", style="italic", color="#64748b")
+        # The x positions are fractions of the axes, so only the type size
+        # has to be settled once the axes has its final width. Recorded
+        # here rather than recomputed there: span is what the measuring
+        # above cost, and it does not change.
+        ax._flowpy_table_fit = (span, cap)
+
+    def _render_item(self, ax, item: LayoutItem, fs: float = 8,
+                     panel=(3.6, 3.3)):
         layers = self._layers(item)
         if item.show_title:
             ax.set_title(item.title or self._auto_title(item),
@@ -1130,6 +1339,8 @@ class LayoutEditor(QWidget):
             ax.set_yticks([])
             return
 
+        if item.kind == "table":
+            return self._render_table(ax, item, layers, fs, panel)
         if item.plot_type == "Spectrum":
             return self._render_spectrum(ax, item, layers, fs)
         ref = layers[0].sample
