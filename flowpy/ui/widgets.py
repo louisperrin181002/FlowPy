@@ -282,6 +282,26 @@ def _group_by_laser(channels: list[str]) -> list[tuple[str, list[str]]]:
     return [g for g in out if g[1]]
 
 
+def format_axis_value(v: float | None) -> str:
+    """An axis limit as these boxes show it, or "" for automatic.
+
+    Plain digits with separators where a cytometer's numbers live, rather
+    than 1.21601e+06: the boxes are read off the axis and typed back in,
+    and RangeEdit.value() strips the separators again.
+
+    A shared function and not just formatting inside set_value, because
+    the rounding has to be known elsewhere: a box showing -251,450 is
+    reporting a limit of -251,450.3, and anything comparing what is in a
+    box with a computed limit has to compare them at the same precision
+    or they never agree.
+    """
+    if v is None:
+        return ""
+    a = abs(float(v))
+    return (f"{v:,.0f}" if a >= 1000
+            else f"{v:.4g}" if a >= 1 else f"{v:.3g}")
+
+
 class RangeEdit(QLineEdit):
     """Axis limit box where empty means automatic.
 
@@ -314,15 +334,7 @@ class RangeEdit(QLineEdit):
         # otherwise replace what someone was halfway through entering.
         if self.hasFocus():
             return
-        if v is None:
-            self.setText("")
-            return
-        # Plain digits with separators where a cytometer's numbers live,
-        # rather than 1.21601e+06: these boxes are read off the axis and
-        # typed back in, and value() strips the separators again.
-        a = abs(float(v))
-        self.setText(f"{v:,.0f}" if a >= 1000
-                     else f"{v:.4g}" if a >= 1 else f"{v:.3g}")
+        self.setText(format_axis_value(v))
 
     def setToolTip(self, text: str):
         super().setToolTip(text)

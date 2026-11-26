@@ -72,7 +72,7 @@ if sys.platform == "darwin":
         icon=ICON,
         bundle_identifier="uk.ac.earlham.flowpy",
         info_plist={
-            "CFBundleShortVersionString": "1.4.0",
+            "CFBundleShortVersionString": "1.5.0",
             "CFBundleDisplayName": "FlowPy",
             "NSHighResolutionCapable": True,
             "NSRequiresAquaSystemAppearance": True,   # light theme

@@ -197,6 +197,60 @@ def offscale_summary(reports: dict) -> str:
             + ".  These are drawn on the edge, not where they belong.")
 
 
+def outside_view(sample, idx: np.ndarray, channel: str, transform: str,
+                 view: tuple[float, float] | None) -> dict:
+    """How many of these events the range on screen is leaving out.
+
+    A different thing from offscale() and worth saying separately.
+    Off-scale events are ones the *scale* cannot place, drawn in a stripe
+    on the border where they look like a real population; these are
+    events the scale handles perfectly well and the chosen range excludes.
+    One is a problem with the transform, the other is a consequence of a
+    decision — but either way a percentage is being read off a picture
+    that does not contain it.
+    """
+    if view is None:
+        return {"n": 0, "below": 0, "above": 0}
+    vals = apply_transform(np.asarray(sample.column(channel)[idx],
+                                      dtype=float), transform)
+    vals = vals[np.isfinite(vals)]
+    n = int(vals.size)
+    if n == 0:
+        return {"n": 0, "below": 0, "above": 0}
+    return {"n": n,
+            "below": int(np.count_nonzero(vals < view[0])),
+            "above": int(np.count_nonzero(vals > view[1]))}
+
+
+def outside_view_summary(reports: dict) -> str:
+    """One line warning that the range on screen is hiding events.
+
+    Quiet below a tenth of a percent, like offscale(): a few events past
+    the edge of a million is not worth a warning, and a warning that is
+    always there stops being read.
+    """
+    parts, worst = [], 0.0
+    for axis, r in reports.items():
+        if not r or not r["n"]:
+            continue
+        lost = r["below"] + r["above"]
+        if lost / r["n"] < 0.001:
+            continue
+        worst = max(worst, 100.0 * lost / r["n"])
+        bits = []
+        if r["below"]:
+            bits.append(f"{100 * r['below'] / r['n']:.2g}% below")
+        if r["above"]:
+            bits.append(f"{100 * r['above'] / r['n']:.2g}% above")
+        parts.append(f"{axis}: " + " and ".join(bits))
+    if not parts:
+        return ""
+    return (f"Careful — {worst:.2g}% of this population is outside the "
+            "range shown (" + " · ".join(parts) + "). Press Fit to see all "
+            "of it; any percentage read off this plot is of what is "
+            "on screen.")
+
+
 def density_values(x: np.ndarray, y: np.ndarray, xlim, ylim,
                    bins: int = DENSITY_BINS) -> np.ndarray:
     """Per-event local density from a smoothed 2-D histogram — O(n), unlike

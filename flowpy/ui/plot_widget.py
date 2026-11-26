@@ -38,7 +38,8 @@ from .gate_editor import (
     GateEditor, EditGateDialog, edit_blocker, quadrant_siblings,
 )
 from .plotting import PLOT_TYPES
-from .widgets import ChannelCombo, RangeEdit, check_range_pair
+from .widgets import (ChannelCombo, RangeEdit, check_range_pair,
+                      format_axis_value)
 from .errors import show_error
 
 # Drawing tool modes
@@ -50,6 +51,20 @@ MODE_QUADRANT = "quadrant"
 MODE_RANGE = "range"
 MODE_ZOOMBOX = "zoombox"
 MODE_PAN = "pan"
+
+#: Ready-made axis ranges, offered per axis because each is worked out
+#: from that axis's own channel. "Manual" is not chosen, it is what the
+#: box reports when the numbers in it match none of the others.
+PRESET_AUTO = "Auto"
+PRESET_MANUAL = "Manual"
+RANGE_PRESETS = (PRESET_AUTO, "Full scale", "Data 99%", "Data 99.9%",
+                 "Data min\u2013max", PRESET_MANUAL)
+
+#: The percentile pair behind each "Data …" preset. Trimming both ends by
+#: the same amount keeps the middle of the distribution centred, which is
+#: the point of using one instead of min\u2013max.
+_PRESET_TAILS = {"Data 99%": (0.5, 99.5), "Data 99.9%": (0.05, 99.95),
+                 "Data min\u2013max": (0.0, 100.0)}
 
 _MODES_2D = (MODE_POLYGON, MODE_RECTANGLE, MODE_ELLIPSE, MODE_QUADRANT)
 
@@ -291,8 +306,22 @@ class PlotWidget(QWidget):
         xl_.setSpacing(3)
         xl_.addWidget(self._muted("RANGE"))
         self._range_edits: dict[tuple, RangeEdit] = {}
+        self._range_presets: dict[str, QComboBox] = {}
         for axis in ("X", "Y"):
+            if axis == "Y":
+                xl_.addSpacing(10)
             xl_.addWidget(self._muted(axis))
+            combo = QComboBox()
+            combo.addItems(RANGE_PRESETS)
+            combo.setMaximumWidth(118)
+            combo.setToolTip(
+                f"Ready-made {axis} ranges, worked out from this axis's own "
+                "channel. “Data …” trims that percentage off each tail of "
+                "the population on screen.")
+            combo.activated.connect(
+                lambda _i, a=axis: self._apply_range_preset(a))
+            self._range_presets[axis] = combo
+            xl_.addWidget(combo)
             for end in ("min", "max"):
                 e = RangeEdit("auto")
                 e.setMaximumWidth(70)
@@ -426,13 +455,21 @@ class PlotWidget(QWidget):
         bottom.addWidget(self._shape_box)
         bottom.addSpacing(8)
         bottom.addWidget(self._zoom_box)
-        bottom.addSpacing(8)
-        bottom.addWidget(self._range_box)
         bottom.addStretch()
         self._nav = NavToolbar(self._canvas, self)
         self._nav.setMaximumHeight(30)
         bottom.addWidget(self._nav)
         root.addLayout(bottom)
+
+        # On a row of its own rather than alongside the zoom buttons: two
+        # preset menus and four number boxes do not fit beside everything
+        # else on a laptop, and a toolbar that overflows hides the control
+        # at its end rather than wrapping.
+        range_row = QHBoxLayout()
+        range_row.setContentsMargins(0, 0, 0, 0)
+        range_row.addWidget(self._range_box)
+        range_row.addStretch()
+        root.addLayout(range_row)
 
         self._canvas.mpl_connect("button_press_event", self._on_click)
         self._canvas.mpl_connect("resize_event", self._fit_margins)
@@ -771,7 +808,22 @@ class PlotWidget(QWidget):
         reports = {"X": plotting.offscale(sample, idx, x_ch, x_tr, xlim)}
         if y_ch is not None and ylim is not None:
             reports["Y"] = plotting.offscale(sample, idx, y_ch, y_tr, ylim)
-        text = plotting.offscale_summary(reports)
+        lines = [plotting.offscale_summary(reports)]
+
+        # And, separately, what the chosen range is leaving out. Only when
+        # a range is actually in force: with none, the view is the whole
+        # axis and the off-scale line above already covers everything
+        # being lost.
+        view = self._views.get(self._view_key())
+        if view is not None:
+            hidden = {"X": plotting.outside_view(sample, idx, x_ch, x_tr,
+                                                 view[0])}
+            if y_ch is not None and view[1] is not None:
+                hidden["Y"] = plotting.outside_view(sample, idx, y_ch, y_tr,
+                                                    view[1])
+            lines.append(plotting.outside_view_summary(hidden))
+
+        text = "\n".join(t for t in lines if t)
         self._offscale.setText(text)
         self._offscale.setVisible(bool(text))
 
@@ -955,9 +1007,19 @@ class PlotWidget(QWidget):
             if not ok:
                 return auto
             out = list(auto)
+            auto_raw = inverse_transform(np.asarray(auto, float), transform)
             for i, end in enumerate(("min", "max")):
                 raw = self._range_edits[(axis, end)].value()
                 if raw is None:
+                    continue
+                # A box showing what the automatic range would show *is*
+                # the automatic range. The boxes are a readout, so every
+                # redraw fills them with rounded limits; without this test
+                # the next thing to read them back would apply those
+                # rounded numbers as a deliberate range, pinning an axis
+                # nobody had asked to pin.
+                if format_axis_value(raw) == format_axis_value(
+                        float(auto_raw[i])):
                     continue
                 v = float(apply_transform(np.array([raw], float),
                                           transform)[0])
@@ -976,6 +1038,104 @@ class PlotWidget(QWidget):
             self._views[self._view_key()] = (nx, None if hist else ny)
         self.schedule_refresh()
 
+    def _axis_channel(self, axis: str) -> tuple:
+        """(channel, transform) of one axis, or (None, None)."""
+        if axis == "X":
+            return self.x_channel(), self.x_transform()
+        return (None, None) if self.is_histogram() else (self.y_channel(),
+                                                         self.y_transform())
+
+    def _population_values(self, channel: str) -> np.ndarray:
+        """This axis's channel over the whole population on screen.
+
+        The population itself, not the subsample the plot is drawn from:
+        a preset is a number someone may quote, and it should not move
+        slightly each time the plot happens to be redrawn.
+        """
+        mask = self._population_mask()
+        col = np.asarray(self._sample.column(channel), dtype=float)
+        v = col[mask] if mask is not None else col
+        return v[np.isfinite(v)]
+
+    def _preset_limits(self, axis: str, name: str):
+        """(min, max) in channel units for a named preset, or (None, None).
+
+        (None, None) is "Auto" — the boxes are cleared and each axis falls
+        back to its own automatic range.
+        """
+        channel, _ = self._axis_channel(axis)
+        if channel is None or self._sample is None or name == PRESET_AUTO:
+            return None, None
+        if name == "Full scale":
+            lo, hi = self._sample.channel_limits(channel)
+            return float(lo), float(hi)
+        tails = _PRESET_TAILS.get(name)
+        if tails is None:
+            return None, None
+        v = self._population_values(channel)
+        if v.size == 0:
+            return None, None
+        lo, hi = (float(x) for x in np.percentile(v, tails))
+        # A population sitting on one value has no range to show; left to
+        # itself it would collapse the axis to nothing.
+        return (None, None) if hi <= lo else (lo, hi)
+
+    def _apply_range_preset(self, axis: str):
+        name = self._range_presets[axis].currentText()
+        if name == PRESET_MANUAL or self._sample is None:
+            return
+        lo, hi = self._preset_limits(axis, name)
+        for end, v in (("min", lo), ("max", hi)):
+            box = self._range_edits[(axis, end)]
+            box.complain("")
+            box.clearFocus()        # set_value refuses to overwrite a box
+            box.set_value(v)        # someone is typing into
+        self._apply_typed_range()
+
+    def _sync_preset_boxes(self):
+        """Show which preset the current limits match, or Manual."""
+        for axis, combo in self._range_presets.items():
+            channel, _ = self._axis_channel(axis)
+            combo.setEnabled(channel is not None)
+            if channel is None:
+                continue
+            typed = tuple(self._range_edits[(axis, e)].value()
+                          for e in ("min", "max"))
+            name = PRESET_MANUAL
+            # The one already chosen is tried first: two presets can come
+            # out identical on a given file — a population spanning the
+            # whole channel makes "Data min-max" and "Full scale" the same
+            # range — and the menu should not jump to the other one.
+            current = combo.currentText()
+            order = ([current] + [c for c in RANGE_PRESETS if c != current]
+                     if current in RANGE_PRESETS else list(RANGE_PRESETS))
+            for candidate in order:
+                if candidate == PRESET_MANUAL:
+                    continue
+                want = self._preset_limits(axis, candidate)
+                if candidate == PRESET_AUTO:
+                    # Auto is "no limits of its own", which on screen is
+                    # the axis sitting at its automatic range.
+                    full = self._full_limits()[0 if axis == "X" else 1]
+                    lim = (self._ax.get_xlim() if axis == "X"
+                           else self._ax.get_ylim())
+                    if full is not None and _same_range(lim, full):
+                        name = PRESET_AUTO
+                        break
+                    continue
+                if None in want or None in typed:
+                    continue
+                # Compared as the boxes print them: a box reading -118,676
+                # holds a limit of -118,675.6, and comparing the numbers
+                # themselves they never agree.
+                if all(format_axis_value(t) == format_axis_value(w)
+                       for t, w in zip(typed, want)):
+                    name = candidate
+                    break
+            combo.blockSignals(True)
+            combo.setCurrentText(name)
+            combo.blockSignals(False)
+
     def _sync_range_boxes(self):
         """Show what the axes are currently on, in channel units."""
         if self._sample is None or self.is_spectrum():
@@ -992,6 +1152,7 @@ class PlotWidget(QWidget):
         if hist:
             for end in ("min", "max"):
                 self._range_edits[("Y", end)].set_value(None)
+        self._sync_preset_boxes()
 
     def fit_view(self):
         """Back to the whole range of the current axes."""
@@ -1088,6 +1249,7 @@ class PlotWidget(QWidget):
         for w in (self._x_label, self._x_combo, self._x_scale,
                   self._zoom_box, self._range_box):
             w.setVisible(not spec)
+        self._range_presets["Y"].setEnabled(not hist)
         # A histogram's Y axis is a count the plot chooses for itself, so
         # its limit boxes are greyed rather than hidden: a control that
         # vanishes is one people hunt for and conclude is missing.
