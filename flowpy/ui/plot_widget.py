@@ -48,8 +48,50 @@ MODE_RECTANGLE = "rectangle"
 MODE_ELLIPSE = "ellipse"
 MODE_QUADRANT = "quadrant"
 MODE_RANGE = "range"
+MODE_ZOOMBOX = "zoombox"
+MODE_PAN = "pan"
 
 _MODES_2D = (MODE_POLYGON, MODE_RECTANGLE, MODE_ELLIPSE, MODE_QUADRANT)
+
+#: Navigating is not gating, but it claims the same drag, so the two
+#: share one exclusive group of buttons.
+_MODES_NAV = (MODE_ZOOMBOX, MODE_PAN)
+
+
+def _same_range(a: tuple, b: tuple) -> bool:
+    """Whether two axis ranges are the same to within rounding.
+
+    Compared with a tolerance rather than exactly. A pan of a few pixels
+    at full zoom comes back a fraction of a ulp off the full range, and an
+    exact test would store that as a zoom — which then stops zooming out
+    from ever reaching the end. The tolerance is a millionth of the span,
+    far finer than a pixel on any screen.
+    """
+    span = max(abs(b[1] - b[0]), 1e-12)
+    return (abs(a[0] - b[0]) < span * 1e-6
+            and abs(a[1] - b[1]) < span * 1e-6)
+
+
+def _shift_into(lo: float, hi: float, bounds: tuple) -> tuple:
+    """Slide [lo, hi] back inside *bounds*, keeping its width.
+
+    Panning is clamped to the data rather than left free: a plot dragged
+    off into empty space looks broken, and finding the events again means
+    pressing Fit and starting over.
+    """
+    span = hi - lo
+    full = bounds[1] - bounds[0]
+    # Snapped when it is the full width to within rounding: subtracting
+    # and re-adding a drag leaves the span a few ulps short, and without
+    # this the view would come back a hair inside the data and count as a
+    # zoom for ever after.
+    if span >= full * (1.0 - 1e-9):
+        return (bounds[0], bounds[1])
+    if lo < bounds[0]:
+        return (bounds[0], bounds[0] + span)
+    if hi > bounds[1]:
+        return (bounds[1] - span, bounds[1])
+    return (lo, hi)
 
 _HINTS = {
     MODE_NONE: "Click a gate to select and edit it · double-click to "
@@ -61,6 +103,10 @@ _HINTS = {
     MODE_QUADRANT: "QUADRANT — click where the quadrant lines should cross "
                    "· Esc to cancel",
     MODE_RANGE: "RANGE — click and drag across the X axis · Esc to cancel",
+    MODE_ZOOMBOX: "ZOOM TO BOX — drag a rectangle to zoom into it · "
+                  "Fit (\u23180) shows everything again",
+    MODE_PAN: "PAN — drag to move the view · middle-drag does the same in "
+              "any tool · Fit (\u23180) shows everything again",
 }
 
 _DRAW_COLOR = theme.WARN
@@ -120,6 +166,12 @@ class PlotWidget(QWidget):
         self._population: Gate | None = None
         self._draw_mode = MODE_NONE
         self._selector = None
+        # Set here rather than when a pan begins. The motion and release
+        # handlers test it on their first line, and matplotlib prints a
+        # callback's exception and carries on — so an uninitialised
+        # attribute here fails silently and the feature simply does
+        # nothing, with no traceback to follow.
+        self._panning = None
         self._quadrant_cid = None
         self._idx_cache: tuple | None = None   # (mask id, indices)
         # Zoomed view per (x channel, x scale, y channel, y scale)
@@ -301,12 +353,16 @@ class PlotWidget(QWidget):
             ("◯ Ellipse",   MODE_ELLIPSE,   "Draw an ellipse gate (E)"),
             ("⊞ Quadrant",  MODE_QUADRANT,  "Draw a quadrant gate (Q)"),
             ("↔ Range",     MODE_RANGE,     "Draw a 1-D range gate (G)"),
+            ("⤢ Zoom box",  MODE_ZOOMBOX,
+             "Drag a rectangle to zoom into it (Z)"),
+            ("✥ Pan",       MODE_PAN,
+             "Drag to move the view — or middle-drag in any tool (H)"),
         ]
         for label, mode, tip in btn_specs:
             btn = QPushButton(label)
             btn.setObjectName("Segment")
             btn.setProperty("first", mode == MODE_NONE)
-            btn.setProperty("last", mode == MODE_RANGE)
+            btn.setProperty("last", mode == MODE_PAN)
             btn.setToolTip(tip)
             btn.setCheckable(True)
             if mode == MODE_NONE:
@@ -383,6 +439,9 @@ class PlotWidget(QWidget):
         self._canvas.mpl_connect("scroll_event", self._on_scroll)
         self._canvas.mpl_connect("button_release_event",
                                  self._on_nav_release)
+        self._canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self._canvas.mpl_connect("button_release_event",
+                                 self._on_button_release)
         QShortcut(QKeySequence(QKeySequence.StandardKey.ZoomIn), self,
                   activated=lambda: self.zoom(1.5))
         QShortcut(QKeySequence("Ctrl+="), self,
@@ -398,7 +457,8 @@ class PlotWidget(QWidget):
         # text fields take printable keys first)
         for key, mode in (("P", MODE_POLYGON), ("R", MODE_RECTANGLE),
                           ("E", MODE_ELLIPSE), ("Q", MODE_QUADRANT),
-                          ("G", MODE_RANGE)):
+                          ("G", MODE_RANGE), ("Z", MODE_ZOOMBOX),
+                          ("H", MODE_PAN)):
             QShortcut(QKeySequence(key), self,
                       activated=lambda m=mode: self._tool_shortcut(m))
 
@@ -793,6 +853,89 @@ class PlotWidget(QWidget):
         self._canvas.draw_idle()
         self._zoom_timer.start()
 
+    def _on_zoombox_done(self, eclick, erelease):
+        """Zoom to the rectangle just dragged."""
+        if self._sample is None or None in (eclick.xdata, erelease.xdata,
+                                            eclick.ydata, erelease.ydata):
+            return
+        hist = self.is_histogram()
+        fx, fy = self._full_limits()
+        x = sorted((float(eclick.xdata), float(erelease.xdata)))
+        y = sorted((float(eclick.ydata), float(erelease.ydata)))
+        # A click, or a box a few pixels across, would zoom into a region
+        # with no events in it — which looks exactly like the plot having
+        # gone blank. Below a two-hundredth of the axis it is a click.
+        if x[1] - x[0] < (fx[1] - fx[0]) / 200.0:
+            return
+        nx = (max(x[0], fx[0]), min(x[1], fx[1]))
+        ny = fy if hist else (max(y[0], fy[0]), min(y[1], fy[1]))
+        if nx[1] <= nx[0] or (not hist and ny[1] <= ny[0]):
+            return
+        self._views[self._view_key()] = (nx, None if hist else ny)
+        self._ax.set_xlim(nx)
+        if not hist:
+            self._ax.set_ylim(ny)
+        self._sync_range_boxes()
+        self._canvas.draw_idle()
+        self._zoom_timer.start()
+
+    def _begin_pan(self, event) -> bool:
+        """Remember where a pan started. True if one did."""
+        if self._sample is None or self.is_spectrum() or \
+                event.inaxes is not self._ax or event.x is None:
+            return False
+        # The press is stored in pixels together with the limits as they
+        # were. Measuring the drag in data coordinates instead would read
+        # each move against limits this very pan is changing, and the
+        # view would slide away under the cursor.
+        self._panning = (event.x, event.y,
+                         self._ax.get_xlim(), self._ax.get_ylim())
+        self._canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
+        return True
+
+    def _drag_pan(self, event):
+        if self._panning is None or event.x is None:
+            return
+        px, py, (x0, x1), (y0, y1) = self._panning
+        box = self._ax.get_window_extent()
+        if box.width <= 0 or box.height <= 0:
+            return
+        hist = self.is_histogram()
+        dx = (event.x - px) * (x1 - x0) / box.width
+        dy = (event.y - py) * (y1 - y0) / box.height
+        fx, fy = self._full_limits()
+        nx = _shift_into(x0 - dx, x1 - dx, fx)
+        ny = (y0, y1) if hist else _shift_into(y0 - dy, y1 - dy, fy)
+        self._ax.set_xlim(nx)
+        if not hist:
+            self._ax.set_ylim(ny)
+        self._canvas.draw_idle()
+
+    def _end_pan(self):
+        if self._panning is None:
+            return
+        self._panning = None
+        self._canvas.setCursor(Qt.CursorShape.ArrowCursor)
+        hist = self.is_histogram()
+        nx, ny = self._ax.get_xlim(), self._ax.get_ylim()
+        fx, fy = self._full_limits()
+        # Panned back to the whole range is Fit, and keeping it as a view
+        # would stop zooming out ever reaching the end.
+        if _same_range(nx, fx) and (hist or _same_range(ny, fy)):
+            self._views.pop(self._view_key(), None)
+        else:
+            self._views[self._view_key()] = (nx, None if hist else ny)
+        self._sync_range_boxes()
+        self._zoom_timer.start()
+
+    def _on_motion(self, event):
+        if self._panning is not None:
+            self._drag_pan(event)
+
+    def _on_button_release(self, event):
+        if self._panning is not None:
+            self._end_pan()
+
     def _apply_typed_range(self):
         """Set the axes from the typed limits (channel units -> display).
 
@@ -827,7 +970,7 @@ class PlotWidget(QWidget):
         ny = fy if hist else span("Y", fy, self.y_transform(), ok_y)
         # Back to the full range is the same thing as Fit, and storing it
         # as a view would stop "zoom out" ever reaching the end.
-        if nx == fx and (hist or ny == fy):
+        if _same_range(nx, fx) and (hist or _same_range(ny, fy)):
             self._views.pop(self._view_key(), None)
         else:
             self._views[self._view_key()] = (nx, None if hist else ny)
@@ -954,7 +1097,8 @@ class PlotWidget(QWidget):
         self._hint.setVisible(not spec)
         for m in _MODES_2D:
             self._mode_buttons[m].setVisible(not hist)
-        self._mode_buttons[MODE_RANGE].setProperty("last", True)
+        self._mode_buttons[MODE_PAN].setProperty("last", True)
+        self._mode_buttons[MODE_RANGE].setProperty("last", False)
         self._mode_buttons[MODE_QUADRANT].setProperty("last", False)
         if spec:
             self._y_scale.blockSignals(True)
@@ -1077,6 +1221,8 @@ class PlotWidget(QWidget):
         box = dict(edgecolor=_DRAW_COLOR, facecolor=_DRAW_COLOR, alpha=0.15,
                    fill=True, linewidth=2.5)
 
+        # button=[1] throughout: a selector takes every button by
+        # default, so a middle-drag would draw a gate as well as pan.
         if mode == MODE_POLYGON:
             self._selector = PolygonSelector(
                 ax, self._on_polygon_done, useblit=True, props=line,
@@ -1084,16 +1230,23 @@ class PlotWidget(QWidget):
                                   markeredgecolor="white"))
         elif mode == MODE_RECTANGLE:
             self._selector = RectangleSelector(
-                ax, self._on_rect_done, useblit=True, props=box)
+                ax, self._on_rect_done, useblit=True, props=box, button=[1])
         elif mode == MODE_ELLIPSE:
             self._selector = EllipseSelector(
-                ax, self._on_ellipse_done, useblit=True, props=box)
+                ax, self._on_ellipse_done, useblit=True, props=box,
+                button=[1])
         elif mode == MODE_QUADRANT:
             self._quadrant_cid = self._canvas.mpl_connect(
                 "button_press_event", self._on_quadrant_click)
         elif mode == MODE_RANGE:
             self._selector = RectangleSelector(
-                ax, self._on_range_done, useblit=True, props=box)
+                ax, self._on_range_done, useblit=True, props=box, button=[1])
+        elif mode == MODE_ZOOMBOX:
+            self._selector = RectangleSelector(
+                ax, self._on_zoombox_done, useblit=True, button=[1],
+                props=dict(edgecolor="#0F172A", facecolor="#0F172A",
+                           alpha=0.12, fill=True, linewidth=1.4,
+                           linestyle="--"))
 
     def _cancel_selector(self):
         if self._selector is not None:
@@ -1253,6 +1406,13 @@ class PlotWidget(QWidget):
         return None
 
     def _on_click(self, event):
+        # Middle-drag pans whatever tool is in hand, so the view can be
+        # moved without putting a half-drawn gate down; the Pan tool is
+        # for a trackpad, which has no middle button.
+        if event.button == 2 or (self._draw_mode == MODE_PAN
+                                 and event.button == 1):
+            if self._begin_pan(event):
+                return
         if (self._draw_mode != MODE_NONE or event.inaxes != self._ax
                 or self.is_spectrum()
                 or event.xdata is None or self._nav.mode):
