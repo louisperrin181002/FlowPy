@@ -3,7 +3,10 @@ application-wide rule that drop-downs are wide enough for their text."""
 
 from __future__ import annotations
 
-from PyQt6.QtWidgets import QComboBox, QCompleter, QApplication
+import numpy as np
+
+from PyQt6.QtWidgets import (QComboBox, QCompleter, QApplication,
+                             QLineEdit)
 from PyQt6.QtCore import Qt, QObject, QEvent
 from PyQt6.QtGui import QStandardItemModel, QStandardItem, QFont
 
@@ -277,3 +280,75 @@ def _group_by_laser(channels: list[str]) -> list[tuple[str, list[str]]]:
     # Empty groups dropped: an instrument with no scatter channels
     # should not show an empty "Scatter & other" heading.
     return [g for g in out if g[1]]
+
+
+class RangeEdit(QLineEdit):
+    """Axis limit box where empty means automatic.
+
+    In the channel's own units, not the transformed position: on a
+    Logicle axis labelled 10², 10³, 10⁵ you type 100000, because that is
+    the number the axis is telling you about. Shared by the Gating tab
+    and the layout editor so the two parse, display and complain alike.
+    """
+
+    def __init__(self, placeholder: str = "auto", parent=None):
+        super().__init__(parent)
+        self.setPlaceholderText(placeholder)
+        self._base_tip = ""
+
+    def value(self) -> float | None:
+        """The number typed, or None for automatic."""
+        try:
+            # Thousands separators removed, since someone reading an axis
+            # may well type 10,000.
+            v = float(self.text().replace(",", "").strip())
+        except ValueError:
+            return None
+        # "inf" and "nan" parse as floats but are not usable axis limits;
+        # both become automatic.
+        return v if np.isfinite(v) else None
+
+    def set_value(self, v: float | None):
+        # Never while it is being typed into: these boxes double as a
+        # readout of the current axis, and a redraw mid-keystroke would
+        # otherwise replace what someone was halfway through entering.
+        if self.hasFocus():
+            return
+        if v is None:
+            self.setText("")
+            return
+        # Plain digits with separators where a cytometer's numbers live,
+        # rather than 1.21601e+06: these boxes are read off the axis and
+        # typed back in, and value() strips the separators again.
+        a = abs(float(v))
+        self.setText(f"{v:,.0f}" if a >= 1000
+                     else f"{v:.4g}" if a >= 1 else f"{v:.3g}")
+
+    def setToolTip(self, text: str):
+        super().setToolTip(text)
+        if not getattr(self, "_complaining", False):
+            self._base_tip = text
+
+    def complain(self, reason: str):
+        """Mark the box as holding something unusable, and say why.
+
+        An inverted pair used to be dropped in silence: you typed two
+        numbers, the axis did not move, and nothing said the pair was the
+        wrong way round.
+        """
+        self._complaining = bool(reason)
+        self.setStyleSheet(
+            "QLineEdit { border: 1px solid #DC2626; }" if reason else "")
+        super().setToolTip(reason or self._base_tip)
+
+
+def check_range_pair(lo: RangeEdit, hi: RangeEdit) -> bool:
+    """True when the pair makes a usable range; marks both when it does not."""
+    a, b = lo.value(), hi.value()
+    bad = a is not None and b is not None and b <= a
+    reason = ("The maximum has to be greater than the minimum — "
+              "this range is being ignored, and the axis left automatic."
+              if bad else "")
+    lo.complain(reason)
+    hi.complain(reason)
+    return not bad

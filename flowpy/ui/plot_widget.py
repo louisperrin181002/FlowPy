@@ -24,7 +24,8 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavToolbar
 from matplotlib.figure import Figure
 from matplotlib.widgets import PolygonSelector, RectangleSelector, EllipseSelector
 
-from ..core.transforms import TRANSFORM_NAMES, inverse_transform
+from ..core.transforms import (TRANSFORM_NAMES, inverse_transform,
+                               apply_transform)
 from ..core.gates import (
     Gate, PolygonGate, RectangleGate, EllipseGate,
     QuadrantGate, RangeGate, BooleanGate, next_gate_color,
@@ -37,7 +38,7 @@ from .gate_editor import (
     GateEditor, EditGateDialog, edit_blocker, quadrant_siblings,
 )
 from .plotting import PLOT_TYPES
-from .widgets import ChannelCombo
+from .widgets import ChannelCombo, RangeEdit, check_range_pair
 from .errors import show_error
 
 # Drawing tool modes
@@ -228,6 +229,29 @@ class PlotWidget(QWidget):
         self._shape_combo.currentIndexChanged.connect(self._on_shape_changed)
         sl.addWidget(self._shape_combo)
 
+        # Typed axis limits, in the channel's own units. The boxes are a
+        # readout as well as a control: they always show what the axes are
+        # currently on, so zooming with the mouse and then reading off or
+        # rounding the exact limits is one gesture rather than two tools.
+        self._range_box = QWidget()
+        xl_ = QHBoxLayout(self._range_box)
+        xl_.setContentsMargins(0, 0, 0, 0)
+        xl_.setSpacing(3)
+        xl_.addWidget(self._muted("RANGE"))
+        self._range_edits: dict[tuple, RangeEdit] = {}
+        for axis in ("X", "Y"):
+            xl_.addWidget(self._muted(axis))
+            for end in ("min", "max"):
+                e = RangeEdit("auto")
+                e.setMaximumWidth(70)
+                e.setToolTip(
+                    f"{axis} axis {end}, in {('the channel' if axis == 'X' else 'the Y channel')}'s "
+                    "own units — on a Logicle axis type 100000, not 10\u2075. "
+                    "Clear it for automatic.")
+                e.editingFinished.connect(self._apply_typed_range)
+                self._range_edits[(axis, end)] = e
+                xl_.addWidget(e)
+
         self._zoom_box = QWidget()
         zl = QHBoxLayout(self._zoom_box)
         zl.setContentsMargins(0, 0, 0, 0)
@@ -346,6 +370,8 @@ class PlotWidget(QWidget):
         bottom.addWidget(self._shape_box)
         bottom.addSpacing(8)
         bottom.addWidget(self._zoom_box)
+        bottom.addSpacing(8)
+        bottom.addWidget(self._range_box)
         bottom.addStretch()
         self._nav = NavToolbar(self._canvas, self)
         self._nav.setMaximumHeight(30)
@@ -671,6 +697,7 @@ class PlotWidget(QWidget):
                               None if hist else y_tr,
                               getattr(self, "_ylim_for_report", None))
 
+        self._sync_range_boxes()
         self._canvas.draw_idle()
 
     def _report_offscale(self, sample, idx, x_ch, x_tr, xlim,
@@ -762,12 +789,72 @@ class PlotWidget(QWidget):
         ax.set_xlim(nx)
         if not hist:
             ax.set_ylim(ny)
+        self._sync_range_boxes()
         self._canvas.draw_idle()
         self._zoom_timer.start()
+
+    def _apply_typed_range(self):
+        """Set the axes from the typed limits (channel units -> display).
+
+        Anything left blank, and any pair the wrong way round, falls back
+        to that axis's automatic range — the pair is marked as it is
+        rejected, so the box says why rather than appearing to be ignored.
+        """
+        if self._sample is None:
+            return
+        hist = self.is_histogram()
+        ok_x = check_range_pair(self._range_edits[("X", "min")],
+                               self._range_edits[("X", "max")])
+        ok_y = hist or check_range_pair(self._range_edits[("Y", "min")],
+                                        self._range_edits[("Y", "max")])
+
+        def span(axis, auto, transform, ok):
+            if not ok:
+                return auto
+            out = list(auto)
+            for i, end in enumerate(("min", "max")):
+                raw = self._range_edits[(axis, end)].value()
+                if raw is None:
+                    continue
+                v = float(apply_transform(np.array([raw], float),
+                                          transform)[0])
+                if np.isfinite(v):
+                    out[i] = v
+            return tuple(out) if out[1] > out[0] else auto
+
+        fx, fy = self._full_limits()
+        nx = span("X", fx, self.x_transform(), ok_x)
+        ny = fy if hist else span("Y", fy, self.y_transform(), ok_y)
+        # Back to the full range is the same thing as Fit, and storing it
+        # as a view would stop "zoom out" ever reaching the end.
+        if nx == fx and (hist or ny == fy):
+            self._views.pop(self._view_key(), None)
+        else:
+            self._views[self._view_key()] = (nx, None if hist else ny)
+        self.schedule_refresh()
+
+    def _sync_range_boxes(self):
+        """Show what the axes are currently on, in channel units."""
+        if self._sample is None or self.is_spectrum():
+            return
+        hist = self.is_histogram()
+        pairs = [("X", self._ax.get_xlim(), self.x_transform())]
+        if not hist:
+            pairs.append(("Y", self._ax.get_ylim(), self.y_transform()))
+        for axis, lim, transform in pairs:
+            raw = inverse_transform(np.asarray(lim, float), transform)
+            for end, v in zip(("min", "max"), raw):
+                self._range_edits[(axis, end)].set_value(
+                    float(v) if np.isfinite(v) else None)
+        if hist:
+            for end in ("min", "max"):
+                self._range_edits[("Y", end)].set_value(None)
 
     def fit_view(self):
         """Back to the whole range of the current axes."""
         self._views.pop(self._view_key(), None)
+        for e in self._range_edits.values():
+            e.complain("")          # a rejected pair is no longer in force
         self.schedule_refresh()
 
     def _on_scroll(self, event):
@@ -784,6 +871,7 @@ class PlotWidget(QWidget):
             hist = self.is_histogram()
             self._views[self._view_key()] = (
                 self._ax.get_xlim(), None if hist else self._ax.get_ylim())
+            self._sync_range_boxes()
             self._zoom_timer.start()
 
     def _update_breadcrumb(self):
@@ -855,8 +943,13 @@ class PlotWidget(QWidget):
         self._y_label.setVisible(not hist)
         self._y_label.setText("INTENSITY" if spec else "Y")
         for w in (self._x_label, self._x_combo, self._x_scale,
-                  self._zoom_box):
+                  self._zoom_box, self._range_box):
             w.setVisible(not spec)
+        # A histogram's Y axis is a count the plot chooses for itself, so
+        # its limit boxes are greyed rather than hidden: a control that
+        # vanishes is one people hunt for and conclude is missing.
+        for end in ("min", "max"):
+            self._range_edits[("Y", end)].setEnabled(not hist)
         self._gate_bar.setVisible(not spec)
         self._hint.setVisible(not spec)
         for m in _MODES_2D:
@@ -921,7 +1014,7 @@ class PlotWidget(QWidget):
     def _emit_add_to_layout(self):
         if self._sample is None:
             return
-        self.add_to_layout.emit({
+        spec = {
             "population_ids": [self._population.gate_id
                                if self._population else ""],
             "plot_type": self._plot_type.currentText(),
@@ -929,7 +1022,26 @@ class PlotWidget(QWidget):
             "y_channel": self.y_channel(),
             "x_transform": self.x_transform(),
             "y_transform": self.y_transform(),
-        })
+        }
+        # Carry the zoom across. The layout stores axis limits in channel
+        # units and applies its own panel's transform to them, which is
+        # both what this has to convert back to and what lets the range
+        # survive a change of scale there. Only the ends that differ from
+        # the automatic range are sent, so an unzoomed plot still arrives
+        # on "auto" rather than pinned to today's limits.
+        view = self._views.get(self._view_key())
+        if view:
+            hist = self.is_histogram()
+            fx, fy = self._full_limits()
+            axes = [("x", view[0], self.x_transform(), fx)]
+            if not hist and view[1] is not None and fy is not None:
+                axes.append(("y", view[1], self.y_transform(), fy))
+            for name, lim, transform, full in axes:
+                raw = inverse_transform(np.asarray(lim, float), transform)
+                for end, i in (("min", 0), ("max", 1)):
+                    if abs(lim[i] - full[i]) > 1e-9 and np.isfinite(raw[i]):
+                        spec[f"{name}_{end}"] = float(raw[i])
+        self.add_to_layout.emit(spec)
 
     # ------------------------------------------------------------------
     # Interactive gate drawing

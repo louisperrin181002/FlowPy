@@ -36,7 +36,7 @@ from ..core.statistics import STAT_NAMES, stat_1d, stat_label
 from . import plotting
 from .plotting import PLOT_TYPES, PALETTES, COLORMAPS
 from .gate_tree_widget import _bfs
-from .widgets import ChannelCombo
+from .widgets import ChannelCombo, RangeEdit, check_range_pair
 from ..core.spectral import spectral_detectors, detector_kind
 from ..core.statistics import sample_stats
 from .errors import show_error
@@ -211,29 +211,6 @@ def _scrolled(widget: QWidget) -> QScrollArea:
     area.setWidgetResizable(True)
     area.setFrameShape(QFrame.Shape.NoFrame)
     return area
-
-
-class _RangeEdit(QLineEdit):
-    """Number box where empty means automatic."""
-
-    def __init__(self, placeholder: str):
-        super().__init__()
-        self.setPlaceholderText(placeholder)
-
-    def value(self) -> float | None:
-        """The number typed, or None for automatic."""
-        try:
-            # Thousands separators removed, since a user reading an axis
-            # may well type 10,000.
-            v = float(self.text().replace(",", "").strip())
-        except ValueError:
-            return None
-        # "inf" and "nan" parse as floats but are not usable axis
-        # limits; both become automatic.
-        return v if np.isfinite(v) else None
-
-    def set_value(self, v: float | None):
-        self.setText("" if v is None else f"{v:g}")
 
 
 class LayoutEditor(QWidget):
@@ -456,8 +433,15 @@ class LayoutEditor(QWidget):
         form = QFormLayout(w)
         self._x_combo, self._x_scale = ChannelCombo(), QComboBox()
         self._y_combo, self._y_scale = ChannelCombo(), QComboBox()
-        self._x_min, self._x_max = _RangeEdit("auto"), _RangeEdit("auto")
-        self._y_min, self._y_max = _RangeEdit("auto"), _RangeEdit("auto")
+        self._x_min, self._x_max = RangeEdit("auto"), RangeEdit("auto")
+        self._y_min, self._y_max = RangeEdit("auto"), RangeEdit("auto")
+        for lo, hi, axis in ((self._x_min, self._x_max, "X"),
+                             (self._y_min, self._y_max, "Y")):
+            for e, end in ((lo, "min"), (hi, "max")):
+                e.setToolTip(
+                    f"{axis} axis {end}, in the channel's own units — on a "
+                    "Logicle axis type 100000, not 10\u2075. "
+                    "Clear it for automatic.")
         self._x_label = QLineEdit()
         self._y_label = QLineEdit()
         for axis, ch, sc, lo, hi, lab in (
@@ -993,6 +977,12 @@ class LayoutEditor(QWidget):
         item.y_transform = self._y_scale.currentText()
         item.x_label = self._x_label.text().strip()
         item.y_label = self._y_label.text().strip()
+        # Checked as a pair before being stored, so an inverted range is
+        # marked in the box that holds it. It is still stored and still
+        # falls back to the automatic range when drawn — the complaint is
+        # what was missing, not the fallback.
+        check_range_pair(self._x_min, self._x_max)
+        check_range_pair(self._y_min, self._y_max)
         item.x_min, item.x_max = self._x_min.value(), self._x_max.value()
         item.y_min, item.y_max = self._y_min.value(), self._y_max.value()
         item.show_title = self._show_title_cb.isChecked()
